@@ -1,0 +1,39 @@
+{
+  "schema": "firmae-report-v1",
+  "observed_at": "2026-10-20T08:00:00Z",
+  "tool": {
+    "name": "FirmAE",
+    "version": "test-1",
+    "commit": null,
+    "environment": "test"
+  },
+  "input": {
+    "firmware_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "rootfs_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "original_target_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "brand": "test-brand",
+    "filename": "firmware.bin"
+  },
+  "results": {
+    "compatibility": "yes",
+    "boot": "partial",
+    "network": "observed",
+    "rootfs": "extracted",
+    "architecture": "mips32be"
+  },
+  "services": [
+    {
+      "path": "sbin/httpd",
+      "target_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "protocol": "http",
+      "port": 80
+    }
+  ],
+  "patch_suggestions": [
+    {
+      "address_static": "0x00407e80",
+      "function": "sub_x",
+      "suggestion": "Check the destination capacity before strcat."
+    }
+  ]
+}

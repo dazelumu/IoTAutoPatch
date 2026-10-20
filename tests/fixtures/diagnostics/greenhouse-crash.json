@@ -1,0 +1,49 @@
+{
+  "schema": "greenhouse-report-v1",
+  "observed_at": "2026-10-20T08:01:00Z",
+  "tool": {
+    "name": "Greenhouse",
+    "version": "test-1",
+    "commit": null,
+    "environment": "test"
+  },
+  "input": {
+    "firmware_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "rootfs_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "target": {
+    "original_target_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "transformed_target_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "interventions": [
+    {
+      "kind": "environment_patch",
+      "detail": "Provided a minimal NVRAM accessor.",
+      "log_path": "/home/lumu/firmware-lab/case/raw.log"
+    }
+  ],
+  "crashes": [
+    {
+      "signal": "SIGSEGV",
+      "pc_static": "0x00407e88",
+      "ra_static": "0x00408000",
+      "registers": {
+        "sp": "0x7fff0000"
+      },
+      "backtrace": [
+        {
+          "index": 0,
+          "address_static": "0x00407e88",
+          "symbol": "sub_x"
+        }
+      ],
+      "crashing_input_ref": "raw/input-001"
+    }
+  ],
+  "patch_suggestions": [
+    {
+      "function": "sub_x",
+      "suggestion": "Bound the copy and preserve NUL termination."
+    }
+  ]
+}

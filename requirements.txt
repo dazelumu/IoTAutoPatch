@@ -1,0 +1,5 @@
+PyYAML>=6,<7
+pyelftools>=0.32,<1
+tree-sitter>=0.24,<0.26
+tree-sitter-c>=0.23,<0.25
+tree-sitter-cpp>=0.23,<0.24

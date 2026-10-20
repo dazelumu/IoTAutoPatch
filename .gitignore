@@ -1,0 +1,55 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+/.codex/
+/.pytest-tmp/
+.venv/
+*.egg-info/
+build/
+dist/
+repair-results/
+.test-temp-*/
+.linux-test-temp-*/
+.linux-tools/
+.linux-python/
+.test-python/
+.pip-temp/
+.test-binding-*/
+.linux-binding-*/
+
+# Local verification workspaces and extracted packages.
+/.test-*/
+/.linux-*/
+/.review-*/
+/.package-verify-*/
+/.update-rule-check/
+
+# Local credentials and case configuration; keep shareable examples.
+.env
+.env.*
+!.env.example
+/case.yaml
+/case.*.yaml
+/config*.yaml
+
+# Local archives, historical experiments and task material are not team source.
+/local-archive/
+/tmp/
+/experiments/
+/firmware-dataset/
+
+# Case documentation is shareable; local case inputs and generated evidence are not.
+/cases/**
+!/cases/README.md
+!/cases/**/
+!/cases/**/README.md
+!/cases/**/poc/*.py
+!/cases/**/patches/*.c
+!/cases/**/config/*.example.yaml
+!/cases/**/results/*.json
+/cases/**/archive/**
+/project-vuln-repair-*.zip
+/project-vuln-repair-*.zip.sha256
+/project-vuln-repair/
+/.git-restart-original/
+/.git-restart-incomplete/
