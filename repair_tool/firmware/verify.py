@@ -33,6 +33,76 @@ from .tests import (_http_status, _observe_exits, delivery_complete, run_tests,
                     verdict)
 
 REDEPLOY_WAIT = 1.0
+FUNCTIONAL_REASONS = {
+    "http_status_mismatch", "contains_mismatch", "missing_cookie",
+    "too_many_cookies", "marker_not_created",
+}
+
+
+def _append_phase_restart(logs: Path, record: dict) -> None:
+    """Persist each phase boundary as soon as it is established."""
+    path = logs / "phase-restarts.json"
+    records = []
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                records = loaded
+        except (OSError, ValueError):
+            records = []
+    records.append(record)
+    save_json(path, records)
+
+
+def _same_candidate_restart(control: SessionControl, expected_sha: str,
+                            phase: str,
+                            logs: Path,
+                            transaction: str | None = None) -> dict:
+    """Restart a deployed candidate between verification phases.
+
+    Fixed checks, marker replay and generated tests each establish their own
+    service state.  A successful fixed check must not be followed by a replay
+    through an authenticated connection or httpd state left over from that
+    phase.  The restart is evidence-bearing, not a retry: the deployed bytes
+    must remain identical and every restart is recorded for audit.
+    """
+    before = control.current_target()
+    if before["sha256"] != expected_sha:
+        raise RepairError(
+            "integrity_failed",
+            f"{phase} verification started with unexpected target bytes")
+    control.restart(transaction=transaction)
+    after = control.current_target()
+    if after["sha256"] != expected_sha:
+        raise RepairError(
+            "integrity_failed",
+            f"{phase} restart loaded bytes different from the candidate")
+    record = {
+        "phase": phase,
+        "before": {key: before.get(key) for key in ("pid", "sha256")},
+        "after": {key: after.get(key) for key in ("pid", "sha256")},
+        "same_sha256": True,
+    }
+    _append_phase_restart(logs, record)
+    return record
+
+
+def _retryable_transport_failure(execution: dict) -> bool:
+    """Recognize a pure response-transport hiccup after candidate startup.
+
+    A candidate that changed response semantics, still created the marker, or
+    produced a process exit has a decisive behavioral verdict.  Only a stable
+    candidate whose sole failure is an incomplete HTTP response is eligible
+    for one controlled replay after an audited same-bytes restart.
+    """
+    if execution.get("passed") or not execution.get("stable_identity"):
+        return False
+    failures = [item for item in execution.get("results", [])
+                if isinstance(item, dict) and item.get("status") != "ok"]
+    return bool(failures) and all(
+        item.get("reason") == "incomplete_response" and not item.get("exits")
+        for item in failures
+    )
 
 
 def run_fixed_checks(control: SessionControl, checks: list[dict], logs: Path, *,
@@ -136,6 +206,34 @@ def replay_plan(control: SessionControl, plan: dict, logs: Path, *,
             protocol=HTTP_ASCII_AUTH_FORM_MULTI_STEP_PORT80,
             phase="candidate", marker=plan["marker"],
             exit_timeout=exit_timeout, deadline=deadline)
+        transport_retry = None
+        diagnostic_execution = None
+        if _retryable_transport_failure(execution):
+            diagnostic_execution = execution
+            save_json(logs / "replay-attempt-1.json", execution)
+            try:
+                restart = _same_candidate_restart(
+                    control, target0["sha256"], "replay-transport-retry",
+                    logs, transaction=transaction)
+            except RepairError as restart_exc:
+                if firmware_deadline_exceeded(restart_exc):
+                    raise
+                transport_retry = {
+                    "attempted": True,
+                    "restart_failed": str(restart_exc)[:1000],
+                }
+            else:
+                second = execute_steps(
+                    control, plan["requests"],
+                    protocol=HTTP_ASCII_AUTH_FORM_MULTI_STEP_PORT80,
+                    phase="candidate", marker=plan["marker"],
+                    exit_timeout=exit_timeout, deadline=deadline)
+                transport_retry = {
+                    "attempted": True,
+                    "restart": restart,
+                    "first_attempt": "replay-attempt-1.json",
+                }
+                execution = second
         bad = [{"id": item["id"], "status": item["status"],
                 "reason": item.get("reason")}
                for item in execution["results"] if item["status"] != "ok"]
@@ -147,6 +245,8 @@ def replay_plan(control: SessionControl, plan: dict, logs: Path, *,
             "results": execution["results"],
             "violations": bad,
         }
+        if transport_retry is not None:
+            replay["transport_retry"] = transport_retry
         save_json(logs / "replay.json", replay)
         if bad or not execution["passed"] \
                 or not marker_scenario_passed(execution, phase="candidate"):
@@ -156,7 +256,41 @@ def replay_plan(control: SessionControl, plan: dict, logs: Path, *,
             ]
             if not execution["passed"] and not reasons:
                 reasons.append("marker replay did not complete")
-            raise RepairError("verification_failed", "; ".join(reasons))
+            failure = next(
+                (item for item in (
+                    (diagnostic_execution or execution)["results"])
+                 if item.get("status") != "ok"), {})
+            failure_id = failure.get("id")
+            plan_steps = plan.get("requests", [])
+            failure_index = next(
+                (index for index, item in enumerate(plan_steps)
+                 if item.get("id") == failure_id), None)
+            trigger_index = next(
+                (index for index, item in enumerate(plan_steps)
+                 if item.get("expect") == "marker_created"), None)
+            reason = failure.get("reason") or ""
+            verification_class = None
+            if reason == "unexpected_marker":
+                verification_class = "marker_still_created"
+            elif (trigger_index is not None
+                    and failure_index is not None
+                    and failure_index < trigger_index):
+                verification_class = (
+                    "pre_trigger_transport_failure"
+                    if reason == "incomplete_response"
+                    else "pre_trigger_functional_failure")
+            elif trigger_index is not None and failure_index == trigger_index:
+                verification_class = (
+                    "trigger_transport_failure"
+                    if reason == "incomplete_response"
+                    else "trigger_functional_failure")
+            elif reason in FUNCTIONAL_REASONS \
+                    or reason.startswith("missing_capture_fields:"):
+                verification_class = "pre_trigger_functional_failure"
+            error = RepairError("verification_failed", "; ".join(reasons))
+            if verification_class is not None:
+                error.verification_class = verification_class
+            raise error
         return replay
     results = []
     for item in plan["requests"]:
@@ -244,14 +378,22 @@ def verify_candidate(control: SessionControl, *, checks: list[dict],
     candidate_sha = control.target_sha()
     fixed = run_fixed_checks(control, checks, logs,
                              exit_timeout=exit_timeout, deadline=deadline)
+    fixed_restart = _same_candidate_restart(
+        control, candidate_sha, "fixed-to-replay", logs,
+        transaction=transaction)
     replay = replay_plan(control, plan, logs, exit_timeout=exit_timeout,
                          transaction=transaction, deadline=deadline)
+    replay_restart = _same_candidate_restart(
+        control, candidate_sha, "replay-to-tests", logs,
+        transaction=transaction)
     results = run_tests(control, tests, logs / "tests", phase="candidate",
                         exit_timeout=exit_timeout, baseline_sha=candidate_sha,
                         transaction=transaction, deadline=deadline)
     outcome = verdict(results)
     save_json(logs / "candidate-verification.json",
-              {"fixed": fixed, "replay": {"stable_identity": replay["stable_identity"]},
+              {"fixed": fixed,
+               "phase_restarts": [fixed_restart, replay_restart],
+               "replay": {"stable_identity": replay["stable_identity"]},
                "tests": outcome})
     if not outcome["passed"]:
         holdout_ids = {t["id"] for t in tests if t["kind"] == "independent"}
@@ -262,7 +404,9 @@ def verify_candidate(control: SessionControl, *, checks: list[dict],
                               "Independent firmware evaluation rejected the candidate")
         raise RepairError("verification_failed",
                           f"Generated tests failed: {outcome['failed']}")
-    return {"fixed": fixed, "replay": replay, "tests": outcome}
+    return {"fixed": fixed,
+            "phase_restarts": [fixed_restart, replay_restart],
+            "replay": replay, "tests": outcome}
 
 
 def redeploy_and_verify(control: SessionControl, *, baseline: Path,

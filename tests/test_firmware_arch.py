@@ -47,7 +47,11 @@ SYNTHETIC_ASM = r"""
 
     .text
     .globl entry
+    .type entry, @function
 entry:
+    lui     $a0, %hi(marker)
+    ori     $a0, $a0, %lo(marker)
+    nop
     lw      $t9, %call16(concat_impl)($gp)
     nop
     jalr    $t9
@@ -70,6 +74,11 @@ concat_impl:
 2:  jr      $ra
      nop
 
+tail_handler:
+    addiu   $v0, $zero, 7
+    jr      $ra
+     nop
+
     /* padding inside the executable segment, as old GNU ld layouts leave */
     .space 0x100
 
@@ -81,9 +90,46 @@ marker:
     .align 12
 globvar:
     .word 0
+marker_pointer:
+    .word marker
+handler_pointer:
+    .word tail_handler
+tail_pointer:
+    .word tail_handler
 """
 
 CALLEE = "concat_impl"
+SPLIT_CALLEE = "split_impl"
+
+SPLIT_SYNTHETIC_ASM = r"""
+/* Mirrors the real firmware pattern where stack setup is inserted between
+   %call16's lw and jalr.  The call must be visible as evidence, but the
+   current redirect encoder cannot replace it. */
+    .set noreorder
+    .set noat
+
+    .text
+    .globl entry
+    .type entry, @function
+entry:
+    lw      $t9, %call16(split_impl)($gp)
+    addiu   $sp, $sp, -32
+    sw      $ra, 28($sp)
+    sw      $s0, 24($sp)
+    move    $s0, $a0
+    jalr    $t9
+     nop
+    lw      $ra, 28($sp)
+    addiu   $sp, $sp, 32
+    jr      $ra
+     nop
+
+    .globl split_impl
+    .type split_impl, @function
+split_impl:
+    jr      $ra
+     nop
+"""
 
 
 @pytest.fixture(scope="module")
@@ -153,6 +199,43 @@ def test_synthetic_elf_analysis_and_scan(synthetic_elf):
         assert padding["capacity"] >= 64
 
 
+def test_split_indirect_call_is_evidence_but_not_redirectable(tmp_path_factory):
+    try:
+        probe = subprocess.run(
+            ["sh", "-c", "command -v clang && clang --version | head -1"],
+            capture_output=True, text=True)
+    except FileNotFoundError:
+        pytest.skip("POSIX shell/clang not available for synthetic ELF")
+    if probe.returncode != 0:
+        pytest.skip("clang not available for synthetic ELF")
+    work = tmp_path_factory.mktemp("mips-split")
+    source = work / "split.s"
+    source.write_text(SPLIT_SYNTHETIC_ASM)
+    binary = work / "split"
+    result = subprocess.run(
+        ["clang", "--target=mips-linux-gnu", "-march=mips32", "-mabi=32",
+         "-EB", "-fuse-ld=lld", "-nostdlib", "-no-pie", "-Wl,-e,entry",
+         str(source), "-o", str(binary)],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        pytest.skip(f"cross toolchain link failed: {result.stderr[:200]}")
+
+    with ElfAnalysis(binary) as analysis:
+        calls = analysis.indirect_calls(SPLIT_CALLEE)
+        assert calls and len(calls) == 1
+        call = calls[0]
+        assert call["sequence"] == "split_t9_jalr"
+        assert call["redirectable"] is False
+        assert call["gap_instruction_count"] == 4
+        assert call["jalr_vaddr"] == call["vaddr"] + 5 * 4
+        function_calls = analysis.function_calls(call["vaddr"])
+        evidence = next(item for item in function_calls
+                        if item["vaddr"] == call["vaddr"])
+        assert evidence["patch_site_eligible"] is False
+        with pytest.raises(ValueError, match="nop between lw and jalr"):
+            analysis.indirect_call_at(call["vaddr"])
+
+
 def test_registry_dispatches_existing_mips32be_boundary(synthetic_elf):
     backend = architecture_backend("mips32be")
     with backend.analyze_elf(synthetic_elf) as analysis:
@@ -163,6 +246,63 @@ def test_registry_dispatches_existing_mips32be_boundary(synthetic_elf):
         assert backend.encode_redirect(registered, 0x480000) == (
             analysis.redirect_words(site["vaddr"], 0x480000))
         assert backend.find_implant_region(analysis, 8)["capacity"] >= 8
+
+
+def test_data_reference_and_function_evidence_queries(synthetic_elf):
+    with ElfAnalysis(synthetic_elf) as analysis:
+        strings = analysis.ascii_matches("NEUTRAL_QUERY_MARKER")
+        assert strings
+        marker_address = strings[0]
+        references = analysis.data_references(marker_address)
+        assert references
+        literal = next(item for item in references
+                       if item["kind"] == "literal_pair")
+        assert literal["low_instruction"] == "ori"
+        assert analysis.bytes_at(literal["vaddr"], 8) == bytes.fromhex(
+            literal["bytes_hex"])
+
+        function = analysis.containing_function(literal["vaddr"])
+        assert function is not None
+        assert function["method"] == "symbol"
+        assert function["start"] <= literal["vaddr"] < function["end"]
+        calls = analysis.function_calls(literal["vaddr"])
+        assert any(call["kind"] == "indirect_jalr"
+                   and call["callee"] == CALLEE for call in calls)
+
+
+def test_data_pointer_can_recover_stripped_function_start(synthetic_elf):
+    with ElfAnalysis(synthetic_elf) as analysis:
+        tail_address = analysis.symbol("tail_handler")
+        assert tail_address
+        # tail_handler intentionally has no STT_FUNC type.  A data word
+        # pointing at its first instruction must still recover the start.
+        tail = analysis.containing_function(tail_address)
+        assert tail == {"start": tail_address,
+                        "end": tail_address + 12,
+                        "name": None,
+                        "method": "start_candidate_heuristic"}
+
+
+def test_data_table_context_decodes_pointer_table(synthetic_elf):
+    with ElfAnalysis(synthetic_elf) as analysis:
+        marker_address = analysis.ascii_matches("NEUTRAL_QUERY_MARKER")[0]
+        references = analysis.data_references(marker_address)
+        word_reference = next(item for item in references
+                              if item["kind"] == "word")
+        context = analysis.data_table_context(word_reference["vaddr"])
+
+        assert context["address"] == word_reference["vaddr"]
+        classifications = {item["classification"] for item in context["words"]}
+        assert {"ascii_pointer", "executable_pointer"} <= classifications
+        ascii_word = next(item for item in context["words"]
+                          if item["classification"] == "ascii_pointer")
+        executable_word = next(
+            item for item in context["words"]
+            if item["classification"] == "executable_pointer"
+            and isinstance(item.get("function"), dict))
+        assert ascii_word["value"] == marker_address
+        assert executable_word["function"]["start"] <= executable_word["value"] \
+            < executable_word["function"]["end"]
 
 
 # ------------------------------------------------------------ evidence + query
@@ -194,6 +334,45 @@ def test_ledger_and_query_session(synthetic_elf, tmp_path):
                                   "text": "NEUTRAL_QUERY_MARKER"})
         assert strings["matches"]
         assert all("address_hex" in match for match in strings["matches"])
+        references = session.handle({
+            "op": "data_references", "address": strings["matches"][0]["address"],
+        })
+        assert references["total"] >= 1
+        assert all(item["kind"] in {"literal_pair", "word"}
+                   for item in references["references"])
+        word_reference = next(
+            (item for item in references["references"]
+             if item["kind"] == "word"), None)
+        assert word_reference is not None
+        table = session.handle({
+            "op": "data_table_context",
+            "address": word_reference["vaddr"],
+        })
+        assert table["address"] == word_reference["vaddr"]
+        assert any(item["classification"] == "ascii_pointer"
+                   and item["value"] == strings["matches"][0]["address"]
+                   for item in table["words"])
+        assert any(item["classification"] == "executable_pointer"
+                   and "function" in item for item in table["words"])
+        assert any(item["op"] == "data_table_context"
+                   for item in EvidenceSession.describe_static())
+        containing = session.handle({
+            "op": "containing_function",
+            "address": references["references"][0]["vaddr"],
+        })
+        assert containing["found"] is True
+        function_calls = session.handle({
+            "op": "function_calls", "address": containing["function"]["start"],
+        })
+        assert function_calls["calls"]
+        paged = session.handle({
+            "op": "function_calls",
+            "address": containing["function"]["start"], "offset": 0, "limit": 1,
+        })
+        assert paged["total"] == len(function_calls["calls"])
+        assert paged["returned"] == 1
+        if paged["total"] > 1:
+            assert paged["next_offset"] == 1 and paged["truncated"] is True
 
         # disassemble around the site
         answer = session.handle({"op": "disassemble", "site": sites[0]["vaddr"], "around": 8})

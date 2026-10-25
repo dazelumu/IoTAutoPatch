@@ -43,21 +43,26 @@ from ..model import ModelClient, redact_data
 from ..storage import save_json, sha
 from .evidence import (EvidenceLedger, localization_view,
                        register_runtime_exits)
+from .http_multi_step import execute_steps
 from .implant import build_candidate
 from .plan import plan_prompt, transport_note, validate_plan
 from .propose import proposal_prompt, validate_proposal
+from .protocol import (HTTP_ASCII_AUTH_FORM_MULTI_STEP_PORT80,
+                      HTTP_ASCII_GET_HEAD_PORT80)
 from .query import DiagnosticAccess, EvidenceSession, load_diagnostic_access
 from .rehost import SessionControl, SessionLock, SessionSupervisor, restore
 from .reproduce import reproduce_and_report
 from .tests import (baseline_oracle, split_holdouts, tests_prompt,
-                    validate_tests)
+                    required_trigger_scenarios, validate_tests)
 from .verify import redeploy_and_verify, run_fixed_checks, verify_candidate
 
 MAX_PLAN_ATTEMPTS = 3
 MAX_TEST_ATTEMPTS = 4
 MAX_LOCALIZE_EXTRA_TURNS = 4
-MAX_REPAIR_PROPOSAL_CYCLES = 2
+MAX_REPAIR_PROPOSAL_CYCLES = 3
 FIRMWARE_MANIFEST_SCHEMA = 3
+MARKER_HANDLER_WINDOW_WORDS = 8
+MARKER_HANDLER_COVERAGE_LIMIT = 8
 ROOTFS_MANIFEST_EXCLUDES = (
     "dev", "proc", "run", "sys", "tmp", "var/lock", "var/run",
 )
@@ -80,6 +85,10 @@ BUFFER_WRITING_CALLEE_TOKENS = {
 CLEANUP_OR_LIFECYCLE_CALLEE_TOKENS = {
     "fclose", "close", "free", "exit", "abort", "sleep", "usleep", "time",
     "gettimeofday", "getpid",
+}
+COMMAND_EXECUTION_CALLEE_TOKENS = {
+    "system", "popen", "exec", "execl", "execlp", "execle", "execv",
+    "execvp", "execve", "posix_spawn", "spawn",
 }
 
 
@@ -377,6 +386,7 @@ class FirmwareWorkflow:
         self.model_factory = model_factory
         self.model = None
         self.plan = None
+        self.reproduction: dict | None = None
         self.tests: list[dict] = []
         self.holdout: list[dict] = []
         self.ledger = None
@@ -394,6 +404,8 @@ class FirmwareWorkflow:
                        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         self.started = time.monotonic()
         self.deadline = self.started + fw["total_timeout_seconds"]
+        self._semantically_rejected_sites: set[int] = set()
+        self._wrapper_same_site_refinements = 0
 
     # -- plumbing ---------------------------------------------------------
     def event(self, stage: str) -> None:
@@ -523,6 +535,8 @@ class FirmwareWorkflow:
             poc_text = poc_text[:20000] + "\n... (truncated)"
         payload = plan_prompt(poc_text, transport_note())
         attempts = []
+        poc_reasoning_effort = self.cfg["repair"].get(
+            "firmware_poc_reasoning_effort", "low")
         for attempt in range(1, MAX_PLAN_ATTEMPTS + 1):
             data = None
             try:
@@ -530,7 +544,8 @@ class FirmwareWorkflow:
                                 self.root / "poc-analysis" / str(attempt),
                                 max_output_tokens=int(self.cfg["repair"].get(
                                     "firmware_conclusion_max_output_tokens",
-                                    24576)))
+                                    24576)),
+                                reasoning_effort=poc_reasoning_effort)
                 self.plan = validate_plan(data)
                 save_json(self.root / "poc-analysis" / "plan.json", self.plan)
                 return
@@ -556,6 +571,8 @@ class FirmwareWorkflow:
         payload = plan_prompt(poc_text, transport_note())
         attempts: list = []
         max_joint_attempts = 4
+        poc_reasoning_effort = self.cfg["repair"].get(
+            "firmware_poc_reasoning_effort", "low")
         for attempt in range(1, max_joint_attempts + 1):
             self.event("poc-analysis" if attempt == 1 else
                        f"replan-{attempt - 1}")
@@ -565,7 +582,8 @@ class FirmwareWorkflow:
                                 self.root / "poc-analysis" / str(attempt),
                                 max_output_tokens=int(self.cfg["repair"].get(
                                     "firmware_conclusion_max_output_tokens",
-                                    24576)))
+                                    24576)),
+                                reasoning_effort=poc_reasoning_effort)
                 self.plan = validate_plan(data)
                 save_json(self.root / "poc-analysis" / "plan.json", self.plan)
             except RepairError as exc:
@@ -613,7 +631,8 @@ class FirmwareWorkflow:
         """Reject stale operator checks before any localization/model repair."""
         self.event("baseline-fixed-checks")
         baseline_sha = sha(self.baseline_bytes)
-        self._restart_on_baseline(expected_sha=baseline_sha)
+        if not self._baseline_target_is_live(baseline_sha):
+            self._restart_on_baseline(expected_sha=baseline_sha)
         try:
             result = run_fixed_checks(
                 self.control, self.cfg["firmware"]["checks"],
@@ -657,6 +676,18 @@ class FirmwareWorkflow:
         clean = {key: context[key] for key in FAULT_CONTEXT_FIELDS
                  if key in context}
         return clean or None
+
+    @classmethod
+    def _neutral_launch_exit(cls, record: dict) -> dict:
+        """Sanitize one pre-readiness launch exit for the local report."""
+        clean = {key: record.get(key) for key in (
+            "pid", "program", "signal", "signal_name", "exit_code", "phase",
+            "launch_id", "identity_confirmed", "intentional",
+        ) if record.get(key) is not None}
+        context = cls._neutral_fault_context(record.get("debug_context"))
+        if context is not None:
+            clean["debug_context"] = context
+        return clean
 
     def _runtime_exit_cursor(self) -> int | None:
         """Snapshot the exit stream immediately before candidate deployment."""
@@ -747,6 +778,288 @@ class FirmwareWorkflow:
         return {t for t in re.split(r"[^a-z0-9]+", callee.lower()) if t}
 
     @staticmethod
+    def _runtime_probe_candidate_sinks(ledger: EvidenceLedger,
+                                       feedback: dict | None,
+                                       fault: dict) -> list[dict]:
+        """Collect model-visible command sinks for bounded runtime probes."""
+        if fault.get("outcome") != "command_injection_marker":
+            return []
+        failed: set[int] = set()
+        if isinstance(feedback, dict):
+            failed_wrapper_sites = feedback.get("failed_wrapper_sites")
+            if isinstance(failed_wrapper_sites, list):
+                for item in failed_wrapper_sites:
+                    if isinstance(item, dict) and type(item.get("site")) is int:
+                        failed.add(item["site"])
+        for entry in ledger.by_kind("runtime_sink_probe"):
+            if entry.get("marker_present") is True and type(entry.get("site")) is int:
+                failed.add(entry["site"])
+        candidates: dict[int, dict] = {}
+        for entry in ledger.by_kind("model_query"):
+            if entry.get("target_kind") != "baseline":
+                continue
+            query, answer = entry.get("query"), entry.get("answer")
+            if (not isinstance(query, dict) or not isinstance(answer, dict)
+                    or query.get("op") != "function_calls"):
+                continue
+            for call in answer.get("calls", []):
+                if not isinstance(call, dict):
+                    continue
+                site = call.get("vaddr")
+                callee = call.get("callee")
+                if (call.get("redirectable") is not True
+                        or type(site) is not int or site in failed
+                        or site in candidates):
+                    continue
+                if cls_probe := FirmwareWorkflow._command_marker_sink_eligibility(
+                        {"callee": callee}):
+                    continue
+                candidates[site] = {
+                    "site": site,
+                    "site_hex": f"0x{site:08x}",
+                    "callee": callee,
+                    "bytes_hex": call.get("bytes_hex"),
+                    "source_evidence": entry.get("id"),
+                }
+        return sorted(candidates.values(), key=lambda item: item["site"])
+
+    def _runtime_sink_probe_proposal(self, candidate: dict) -> dict:
+        """Build the fixed diagnostic-only wrapper used by the controller."""
+        source = (
+            "int repair_entry(const char *cmd) {\n"
+            "    if (cmd == 0) { return 0; }\n"
+            "    while (*cmd != 0) {\n"
+            "        if (*cmd == ';' || *cmd == '`' || *cmd == '|') {\n"
+            "            return 1;\n"
+            "        }\n"
+            "        if (*cmd == '$' && *(cmd + 1) == '(') { return 1; }\n"
+            "        cmd++;\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        return {"edits": [{
+            "site": candidate["site"],
+            "expected_hex": candidate["bytes_hex"],
+            "evidence": [candidate["source_evidence"]],
+            "mode": "wrapper",
+            "contract": {
+                "abi": "wrapper receives the original callee argument",
+                "bounds": "reads until NUL; this diagnostic probe is not model code",
+                "preserve": "return 0 calls the original callee",
+                "invalid": "return nonzero blocks the original callee",
+            },
+            "source": source,
+        }]}
+
+    def _runtime_sink_probe_scenario(self) -> list[dict] | None:
+        """Return the original scenario prefix through a marker trigger.
+
+        A confirmed marker trigger is not a standalone request.  Authentication,
+        anti-CSRF field capture, cookies, and page navigation establish the
+        session state required by the trigger.  Slice the already-validated
+        plan from its first step through the final confirmed trigger so runtime
+        probes replay that same prefix instead of sending an unauthenticated
+        final POST.
+        """
+        plan, reproduction = self.plan, self.reproduction
+        if not isinstance(plan, dict) or not isinstance(reproduction, dict):
+            return None
+        if (plan.get("protocol") != HTTP_ASCII_AUTH_FORM_MULTI_STEP_PORT80
+                or plan.get("outcome") != "command_injection_marker"):
+            return None
+        confirmed = set(reproduction.get("confirmed_ids") or [])
+        trigger_index = None
+        for index, item in enumerate(plan.get("requests", [])):
+            if (isinstance(item, dict) and item.get("id") in confirmed
+                    and item.get("expect") == "marker_created"):
+                trigger_index = index
+        if trigger_index is None:
+            return None
+        steps = [item for item in plan.get("requests", [])[:trigger_index + 1]
+                 if isinstance(item, dict)]
+        return steps or None
+
+    def _runtime_sink_probe_observation(self, execution: dict) -> dict:
+        """Summarize a probe without treating a transport failure as a verdict."""
+        trigger = next((item for item in execution.get("results", [])
+                        if isinstance(item, dict)
+                        and item.get("expect") == "marker_created"), None)
+        marker_after = ((trigger or {}).get("marker_after")
+                        if isinstance(trigger, dict) else None)
+        marker_exists = bool(isinstance(marker_after, dict)
+                             and marker_after.get("exists"))
+        failed_steps = [
+            {"id": item.get("id"), "reason": item.get("reason"),
+             "status": item.get("status")}
+            for item in execution.get("results", [])
+            if isinstance(item, dict) and item.get("status") != "ok"
+        ]
+        trigger_failed = any(item.get("id") == (trigger or {}).get("id")
+                             for item in failed_steps)
+        transport_or_session_failure = bool(
+            failed_steps
+            and any(item.get("reason") in {
+                "incomplete_response", "http_status_mismatch",
+                "contains_mismatch", "missing_cookie",
+            } or str(item.get("reason") or "").startswith("missing_capture_fields:")
+                for item in failed_steps)
+        )
+        if trigger_failed and marker_exists:
+            transport_or_session_failure = False
+        if transport_or_session_failure:
+            marker_present = None
+            marker_blocked = None
+            status = "inconclusive"
+            failure_kind = "transport_or_session_failure"
+        elif marker_exists:
+            marker_present = True
+            marker_blocked = False
+            status = "completed"
+            failure_kind = "marker_not_blocked"
+        elif execution.get("passed"):
+            marker_present = False
+            marker_blocked = True
+            status = "completed"
+            failure_kind = "marker_blocked"
+        else:
+            marker_present = False
+            marker_blocked = None
+            status = "inconclusive"
+            failure_kind = "candidate_execution_failed"
+        return {
+            "status": status,
+            "passed": bool(execution.get("passed") and not marker_present),
+            "marker_blocked": marker_blocked,
+            "marker_present": marker_present,
+            "stable_identity": bool(execution.get("stable_identity")),
+            "failure_kind": failure_kind,
+            "failed_steps": failed_steps,
+        }
+
+    def _runtime_sink_probe(self, feedback: dict, candidates: list[dict],
+                            directory: Path) -> list[dict]:
+        """Deploy bounded wrappers on the private copy to disambiguate sinks."""
+        if self.control is None:
+            return []
+        fault = self.fault_summary()
+        scenario = self._runtime_sink_probe_scenario()
+        if scenario is None:
+            return []
+        self.event("runtime-sink-probe")
+        limit = max(1, int(self.cfg["repair"].get(
+            "firmware_runtime_sink_probe_limit", 3)))
+        selected = candidates[:limit]
+        results: list[dict] = []
+        transaction = self.lock.id if self.lock else None
+        fw = self.cfg["firmware"]
+        stage_deadline = self._stage_deadline(
+            "firmware_relocalize_timeout_seconds")
+        directory.mkdir(parents=True, exist_ok=True)
+        for candidate in selected:
+            self.check_deadline()
+            if time.monotonic() >= stage_deadline:
+                raise RepairError(
+                    "stage_timeout",
+                    "relocalize exceeded its time budget during sink probe")
+            probe_dir = directory / f"{candidate['site']:08x}"
+            record = {
+                "site": candidate["site"],
+                "site_hex": candidate["site_hex"],
+                "callee": candidate["callee"],
+                "source_evidence": candidate["source_evidence"],
+                "status": "inconclusive",
+            }
+            candidate_sha = None
+            deployed = False
+            try:
+                built = build_candidate(
+                    self.baseline_bytes,
+                    self._runtime_sink_probe_proposal(candidate)["edits"],
+                    probe_dir / "build",
+                    deadline=min(self.deadline, stage_deadline))
+                candidate_sha = built["record"]["candidate_sha256"]
+                deployed_target = self.control.replace_target(
+                    built["candidate"], transaction=transaction)
+                deployed = True
+                deployed_sha = (deployed_target.get("target")
+                                if isinstance(deployed_target.get("target"), dict)
+                                else {}).get("sha256")
+                if deployed_sha != candidate_sha:
+                    raise RepairError(
+                        "infrastructure_failed",
+                        "runtime sink probe target hash mismatch")
+                execution = execute_steps(
+                    self.control, scenario,
+                    protocol=HTTP_ASCII_AUTH_FORM_MULTI_STEP_PORT80,
+                    phase="candidate", marker=fault["marker"]["guest_path"],
+                    exit_timeout=float(fw["poc_request_timeout"]),
+                    deadline=self.deadline)
+                observation = self._runtime_sink_probe_observation(execution)
+                record.update(observation)
+            except RepairError as exc:
+                record.update(status="inconclusive", error_status=exc.status,
+                              error=str(exc)[:1000])
+            finally:
+                if deployed:
+                    try:
+                        restore(self.control, self.baseline_bytes,
+                                fw["target"], transaction=transaction)
+                    except RepairError as rollback_exc:
+                        record["rollback_status"] = rollback_exc.status
+                        record["rollback_error"] = str(rollback_exc)[:1000]
+                        self.report.setdefault("warnings", []).append({
+                            "stage": "runtime-sink-probe",
+                            "site": candidate["site"],
+                            "rollback_status": rollback_exc.status,
+                            "rollback_error": str(rollback_exc)[:1000],
+                        })
+                        save_json(probe_dir / "record.json", record)
+                        raise RepairError(
+                            "infrastructure_failed",
+                            f"runtime sink probe rollback failed for site "
+                            f"{candidate['site']:#x}") from rollback_exc
+                    record["rollback_status"] = "baseline_restored"
+                else:
+                    record["rollback_status"] = "not_required"
+            save_json(probe_dir / "record.json", record)
+            evidence_id = self.ledger_for_target().add(
+                "runtime_sink_probe", {
+                    "annotation": "bounded diagnostic wrapper probe; not a repair",
+                    "site": candidate["site"],
+                    "site_hex": candidate["site_hex"],
+                    "callee": candidate["callee"],
+                    "source_evidence": candidate["source_evidence"],
+                    "candidate_sha256": candidate_sha,
+                    "status": record["status"],
+                    "marker_blocked": record.get("marker_blocked"),
+                    "marker_present": record.get("marker_present"),
+                    "stable_identity": record.get("stable_identity"),
+                    "failure_kind": record.get("failure_kind"),
+                    "failed_steps": record.get("failed_steps", []),
+                })
+            record["evidence"] = evidence_id
+            save_json(probe_dir / "record.json", record)
+            results.append(record)
+            if record.get("marker_blocked"):
+                break
+            if record.get("failure_kind") == "transport_or_session_failure":
+                self.report.setdefault("warnings", []).append({
+                    "stage": "runtime-sink-probe",
+                    "site": candidate["site"],
+                    "reason": "transport_or_session_failure",
+                    "notice": (
+                        "Probe scenario could not establish a decisive marker "
+                        "observation; remaining sinks were not consumed"),
+                })
+                break
+        save_json(directory / "result.json", {
+            "status": "completed", "probe_limit": limit,
+            "probes": results,
+        })
+        return results
+
+    @staticmethod
     def _semantic_site_eligibility(entry: dict, fault: dict) -> dict:
         signal = str(fault.get("signal") or "").upper()
         if signal not in MEMORY_FAULT_SIGNALS:
@@ -757,6 +1070,630 @@ class FirmwareWorkflow:
         if tokens & CLEANUP_OR_LIFECYCLE_CALLEE_TOKENS:
             return {"decision": "rejected", "semantic_class": "cleanup_or_lifecycle"}
         return {"decision": "accepted_with_causal_requirement", "semantic_class": "unknown"}
+
+    @classmethod
+    def _command_marker_sink_eligibility(cls, entry: dict) -> dict | None:
+        """Keep marker command-injection fixes on behavior-critical sinks."""
+        tokens = cls._callee_tokens(entry.get("callee"))
+        if not tokens:
+            return {
+                "decision": "deferred",
+                "semantic_class": "command_sink_identity_required",
+                "missing_evidence": ["command_execution_callee_identity"],
+                "required": (
+                    "Identify the exact command-execution call in the "
+                    "recovered request handler before nominating this site"),
+            }
+        if tokens & COMMAND_EXECUTION_CALLEE_TOKENS:
+            return None
+        return {
+            "decision": "rejected",
+            "semantic_class": "non_command_execution_callee",
+            "required": (
+                "For a confirmed command-injection marker, nominate an exact "
+                "system/popen/exec-family call reached from the recovered "
+                "request handler; input/state lookup evidence alone is not "
+                "sufficient"),
+        }
+
+    @staticmethod
+    def _query_address(value: object) -> int | None:
+        if type(value) is int and value > 0:
+            return value
+        if isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]+", value):
+            return int(value, 16)
+        return None
+
+    @staticmethod
+    def _confirmed_marker_requests(reproduction: dict | None,
+                                   plan: dict | None,
+                                   fault: dict | None = None) -> list[dict]:
+        if not isinstance(reproduction, dict):
+            reproduction = {}
+        confirmed_ids = list(reproduction.get("confirmed_ids")
+                             or (plan.get("confirmations")
+                                 if isinstance(plan, dict) else []) or [])
+        detail = reproduction.get("detail")
+        requests = detail if isinstance(detail, list) else []
+        confirmed = [item.get("request") for item in requests
+                if isinstance(item, dict)
+                and item.get("id") in confirmed_ids
+                and isinstance(item.get("request"), dict)]
+        if confirmed or not isinstance(fault, dict):
+            return confirmed
+        marker = fault.get("marker")
+        request = fault.get("request")
+        if (fault.get("outcome") == "command_injection_marker"
+                and isinstance(marker, dict) and marker.get("created") is True
+                and isinstance(request, dict)):
+            return [request]
+        return []
+
+    @staticmethod
+    def _marker_request_signature(request: dict) -> str | None:
+        form = request.get("form")
+        parts = [request.get("method"), request.get("path")]
+        if isinstance(form, dict):
+            parts.extend(form.keys())
+        values = [str(item).lower() for item in parts
+                  if isinstance(item, (str, int)) and str(item).strip()]
+        return " ".join(values) if values else None
+
+    @classmethod
+    def _marker_handler_coverage(cls, fault: dict, reproduction: dict | None,
+                                 plan: dict | None, answers,
+                                 fallback_request: dict | None = None) -> dict:
+        """Recover mandatory handler checks from the model's own evidence.
+
+        A URL/form data table can expose several executable pointers beside a
+        confirmed request string.  The model previously was only advised to
+        inspect every candidate; this state lets the controller enforce that
+        all nearby handlers receive at least one decisive ``function_calls``
+        inspection before unrelated disassembly or nomination.  Addresses are
+        derived exclusively from answers already returned to the model.
+        """
+        requests = cls._confirmed_marker_requests(reproduction, plan, fault)
+        if not requests and fallback_request is not None:
+            requests = [fallback_request]
+        signatures = [signature for signature in
+                      (cls._marker_request_signature(item)
+                       for item in requests) if signature]
+        if (fault.get("outcome") != "command_injection_marker"
+                or not signatures or not isinstance(answers, list)):
+            return {"active": False, "handlers": []}
+
+        ascii_addresses: dict[int, str] = {}
+        references: dict[int, list[dict]] = {}
+        tables: dict[int, list[dict]] = {}
+        for record in answers:
+            if not isinstance(record, dict):
+                continue
+            query, answer = record.get("query"), record.get("answer")
+            if not isinstance(query, dict) or not isinstance(answer, dict):
+                continue
+            op = query.get("op")
+            address = cls._query_address(
+                query.get("address") or query.get("site")
+                or query.get("function"))
+            if op == "ascii_search":
+                text = query.get("text")
+                if isinstance(text, str) and any(
+                        len(text) >= 4 and text.lower() in signature
+                        for signature in signatures):
+                    for match in answer.get("matches", []):
+                        if isinstance(match, dict):
+                            found = cls._query_address(match.get("address"))
+                            if found is not None:
+                                ascii_addresses[found] = text
+            elif op == "data_references" and address is not None:
+                visible = answer.get("references")
+                if isinstance(visible, list):
+                    references[address] = [item for item in visible
+                                           if isinstance(item, dict)]
+            elif op == "data_table_context" and address is not None:
+                visible = answer.get("words")
+                if isinstance(visible, list):
+                    tables[address] = [item for item in visible
+                                       if isinstance(item, dict)]
+
+        recovered: dict[int, dict] = {}
+        overflow = False
+        for string_address, text in ascii_addresses.items():
+            for reference in references.get(string_address, []):
+                if reference.get("kind") != "word":
+                    continue
+                table_address = cls._query_address(reference.get("vaddr"))
+                if table_address is None:
+                    continue
+                words = tables.get(table_address, [])
+                ordered = sorted(
+                    ((index, word) for index, word in enumerate(words)
+                     if cls._query_address(word.get("vaddr")) is not None),
+                    key=lambda item: cls._query_address(
+                        item[1].get("vaddr")))
+                for index, word in ordered:
+                    value = cls._query_address(word.get("value"))
+                    if (word.get("classification") != "ascii_pointer"
+                            or value != string_address):
+                        continue
+                    for direction in (-1, 1):
+                        if direction < 0:
+                            candidate_indices = range(
+                                index - 1,
+                                max(0, index - MARKER_HANDLER_WINDOW_WORDS) - 1,
+                                -1)
+                        else:
+                            candidate_indices = range(
+                                index + 1,
+                                min(len(ordered),
+                                    index + MARKER_HANDLER_WINDOW_WORDS + 1))
+                        for candidate_index in candidate_indices:
+                            handler_word = ordered[candidate_index][1]
+                            if handler_word.get("classification") != \
+                                    "executable_pointer":
+                                continue
+                            handler = cls._query_address(
+                                handler_word.get("value"))
+                            if handler is None:
+                                continue
+                            source = {
+                                "request_string": text,
+                                "string_address": string_address,
+                                "string_address_hex":
+                                    f"0x{string_address:08x}",
+                                "table_address": table_address,
+                                "table_address_hex":
+                                    f"0x{table_address:08x}",
+                                "string_word_vaddr": cls._query_address(
+                                    word.get("vaddr")),
+                                "handler_word_vaddr": cls._query_address(
+                                    handler_word.get("vaddr")),
+                                "distance_words": abs(candidate_index - index),
+                            }
+                            existing = recovered.get(handler)
+                            if existing is None:
+                                recovered[handler] = {
+                                    "address": handler,
+                                    "address_hex": f"0x{handler:08x}",
+                                    "covered": False,
+                                    "sources": [source],
+                                }
+                            elif source not in existing["sources"]:
+                                existing["sources"].append(source)
+                            break
+
+        if len(recovered) > MARKER_HANDLER_COVERAGE_LIMIT:
+            overflow = True
+            ranked = sorted(
+                recovered.values(),
+                key=lambda item: min(source["distance_words"]
+                                     for source in item["sources"]))
+            kept = {item["address"]: item for item in
+                    ranked[:MARKER_HANDLER_COVERAGE_LIMIT]}
+        else:
+            kept = recovered
+
+        for record in answers:
+            if not isinstance(record, dict):
+                continue
+            query, answer = record.get("query"), record.get("answer")
+            if not isinstance(query, dict) or not isinstance(answer, dict):
+                continue
+            if query.get("op") != "function_calls":
+                continue
+            address = cls._query_address(
+                query.get("address") or query.get("function")
+                or query.get("site"))
+            handler = kept.get(address)
+            if handler is None or handler.get("covered"):
+                continue
+            calls = answer.get("calls")
+            contains = query.get("contains")
+            filtered = isinstance(contains, str) and bool(contains.strip())
+            # A filtered page proves coverage only when it returns a call.
+            # An unfiltered page is acceptable even when it is empty: it is
+            # the neutral way to show that this handler has no calls.
+            if isinstance(calls, list) and ((filtered and calls)
+                                            or not filtered):
+                handler["covered"] = True
+                handler["covering_query"] = EvidenceSession.compact_query(
+                    query)
+
+        handlers = sorted(kept.values(), key=lambda item: item["address"])
+        return {
+            "active": True,
+            "window_words": MARKER_HANDLER_WINDOW_WORDS,
+            "candidate_limit": MARKER_HANDLER_COVERAGE_LIMIT,
+            "candidate_limit_applied": overflow,
+            "handlers": handlers,
+            "uncovered_addresses": [item["address"] for item in handlers
+                                    if not item.get("covered")],
+        }
+
+    @classmethod
+    def _marker_handler_gate(cls, query: dict, coverage: dict) -> dict | None:
+        """Return controller feedback for a query that bypasses coverage."""
+        if not coverage.get("active"):
+            return None
+        uncovered = [item for item in coverage.get("handlers", [])
+                     if isinstance(item, dict) and not item.get("covered")]
+        if not uncovered:
+            return None
+        allowed_addresses = {item.get("address") for item in uncovered}
+        if query.get("op") == "function_calls":
+            address = cls._query_address(
+                query.get("address") or query.get("function")
+                or query.get("site"))
+            if address in allowed_addresses:
+                return None
+        required = [{
+            "op": "function_calls",
+            "address": item["address"],
+            "address_hex": item["address_hex"],
+            "suggested": "contains=system or another decisive sink filter",
+        } for item in uncovered]
+        return {
+            "stage_category": "marker_handler_coverage_required",
+            "error": ("Nearby executable handlers recovered from a confirmed "
+                      "request string have not been covered by function_calls"),
+            "submitted_query": EvidenceSession.compact_query(query),
+            "required_queries": required,
+            "rule": ("First run function_calls on every uncovered handler. "
+                     "A filtered empty result does not satisfy coverage; use "
+                     "a different decisive filter or an unfiltered page. "
+                     "Disassembly and register_patch_site are temporarily "
+                     "not allowed."),
+            "provenance": ("Handler addresses come from the model's already "
+                           "returned data_table_context evidence; no device "
+                           "profile or patch candidate is supplied"),
+        }
+
+    @classmethod
+    def _registration_recovery_gate(cls, query: dict,
+                                    deferred_nominations: dict,
+                                    answers: list[dict] | None = None) -> dict | None:
+        """Keep a deferred nomination repair turn focused on its evidence gap."""
+        if not deferred_nominations:
+            return None
+        allowed_sites: set[int] = set()
+        allowed_handlers: set[int] = set()
+        missing: list[str] = []
+        for site, record in deferred_nominations.items():
+            if type(site) is not int or not isinstance(record, dict):
+                continue
+            allowed_sites.add(site)
+            missing.extend(item for item in record.get("missing", [])
+                           if isinstance(item, str) and item not in missing)
+            entry = record.get("entry")
+            if isinstance(entry, dict):
+                function = entry.get("function")
+                if isinstance(function, dict):
+                    start = cls._query_address(function.get("start")
+                                               or function.get("value"))
+                    if start is not None:
+                        allowed_handlers.add(start)
+            # Stripped firmware nominations may not carry a containing
+            # function.  Recover it from the model-visible function_calls page
+            # that exposed the site, without guessing.
+            for previous in reversed(answers or []):
+                query_record = previous.get("query") if isinstance(
+                    previous, dict) else {}
+                answer = previous.get("answer") if isinstance(
+                    previous, dict) else {}
+                if not (isinstance(query_record, dict)
+                        and query_record.get("op") == "function_calls"
+                        and isinstance(answer, dict)):
+                    continue
+                for call in answer.get("calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    if cls._query_address(call.get("vaddr")) == site:
+                        start = cls._query_address(query_record.get(
+                            "address") or query_record.get("function")
+                            or query_record.get("site"))
+                        if start is not None:
+                            allowed_handlers.add(start)
+                        break
+                if allowed_handlers:
+                    break
+                if isinstance(answer.get("function"), dict):
+                    start = cls._query_address(
+                        answer["function"].get("start"))
+                    if start is not None:
+                        allowed_handlers.add(start)
+                        break
+            for previous in reversed(answers or []):
+                query_record = previous.get("query") if isinstance(
+                    previous, dict) else {}
+                answer = previous.get("answer") if isinstance(
+                    previous, dict) else {}
+                if (isinstance(query_record, dict)
+                        and query_record.get("op") == "function_calls"
+                        and isinstance(answer, dict)
+                        and isinstance(answer.get("function"), dict)):
+                    start = cls._query_address(
+                        answer["function"].get("start"))
+                    if start is not None:
+                        allowed_handlers.add(start)
+                        break
+        if not allowed_sites:
+            return None
+        op = query.get("op")
+        if op == "disassemble":
+            address = cls._query_address(query.get("address") or query.get("site"))
+            if address in allowed_sites:
+                return None
+        elif op == "function_calls":
+            address = cls._query_address(
+                query.get("address") or query.get("function")
+                or query.get("site"))
+            if address in allowed_handlers:
+                return None
+        return {
+            "stage_category": "registration_recovery_required",
+            "error": ("A deferred patch-site nomination still needs its "
+                      "listed read-only evidence"),
+            "submitted_query": EvidenceSession.compact_query(query),
+            "required_missing_evidence": missing,
+            "allowed": {
+                "exact_site_disassembly_addresses": [
+                    f"0x{item:08x}" for item in sorted(allowed_sites)],
+                "handler_function_calls_addresses": [
+                    f"0x{item:08x}" for item in sorted(allowed_handlers)],
+            },
+            "rule": ("Run only the decisive read-only query implied by "
+                     "missing_evidence, then register that site or a better "
+                     "one. Broad unrelated sweeps are temporarily rejected."),
+            "budget_charged": False,
+        }
+
+    @classmethod
+    def _marker_site_evidence_eligibility(
+            cls, entry: dict, fault: dict, session,
+            reproduction: dict | None, plan: dict | None) -> dict:
+        """Require a request-string -> handler -> exact-call evidence chain."""
+        if fault.get("outcome") != "command_injection_marker":
+            return {"decision": "accepted",
+                    "semantic_class": "not_marker_fault"}
+        requests = cls._confirmed_marker_requests(reproduction, plan, fault)
+        signatures = [signature for signature in
+                      (cls._marker_request_signature(item)
+                       for item in requests) if signature]
+        if not signatures:
+            return {"decision": "accepted",
+                    "semantic_class": "marker_chain_not_evaluatable"}
+        answers = getattr(session, "answers", [])
+        if not isinstance(answers, list):
+            answers = []
+        ascii_addresses: dict[int, str] = {}
+        references: dict[int, list[dict]] = {}
+        tables: dict[int, list[dict]] = {}
+        functions: dict[int, dict] = {}
+        calls: dict[int, list[dict]] = {}
+        disassembly_windows: list[tuple[int, int]] = []
+        for record in answers:
+            if not isinstance(record, dict):
+                continue
+            query, answer = record.get("query"), record.get("answer")
+            if not isinstance(query, dict) or not isinstance(answer, dict):
+                continue
+            op = query.get("op")
+            address = cls._query_address(
+                query.get("address") or query.get("site")
+                or query.get("function"))
+            if op == "ascii_search":
+                text = query.get("text")
+                if isinstance(text, str) and any(
+                        len(text) >= 4 and text.lower() in signature
+                        for signature in signatures):
+                    for match in answer.get("matches", []):
+                        if isinstance(match, dict):
+                            found = cls._query_address(match.get("address"))
+                            if found is not None:
+                                ascii_addresses[found] = text
+            elif op == "data_references" and address is not None:
+                visible = answer.get("references")
+                if isinstance(visible, list):
+                    references[address] = [item for item in visible
+                                           if isinstance(item, dict)]
+            elif op == "data_table_context" and address is not None:
+                visible = answer.get("words")
+                if isinstance(visible, list):
+                    tables[address] = [item for item in visible
+                                       if isinstance(item, dict)]
+            elif op == "containing_function" and address is not None:
+                function = answer.get("function")
+                if isinstance(function, dict):
+                    functions[address] = function
+            elif op == "function_calls" and address is not None:
+                visible = answer.get("calls")
+                if isinstance(visible, list):
+                    # A broad page and later narrow pages are complementary
+                    # evidence. Replacing the former with the latter erased
+                    # the only visible occurrence of some exact call sites.
+                    calls.setdefault(address, []).extend(
+                        item for item in visible if isinstance(item, dict))
+            elif op == "disassemble":
+                window = answer.get("window")
+                if (address is not None and isinstance(window, dict)
+                        and isinstance(window.get("instructions"), list)):
+                    instructions = window["instructions"]
+                    start = cls._query_address(window.get("start"))
+                    end = cls._query_address(window.get("end"))
+                    if end is None and instructions:
+                        end = max((cls._query_address(item.get("vaddr"))
+                                   or address) for item in instructions)
+                    if start is not None:
+                        disassembly_windows.append(
+                            (start, end if end is not None else address))
+
+        def observed_disassembly(address: int) -> bool:
+            return any(start <= address <= end
+                       for start, end in disassembly_windows)
+
+        site = entry.get("site")
+
+        def contains_site(function: dict) -> bool:
+            return (type(site) is int
+                    and function.get("start") <= site < function.get("end"))
+
+        def observed_site_call(function: dict) -> bool:
+            if type(site) is not int:
+                return False
+            for query_address, visible in calls.items():
+                if not (function.get("start", 0) <= query_address
+                        < function.get("end", 0)):
+                    continue
+                if any(cls._query_address(item.get("vaddr")) == site
+                       or item.get("vaddr") == site for item in visible):
+                    return True
+            return False
+
+        candidate_handlers: list[dict] = []
+        for string_address, text in ascii_addresses.items():
+            for reference in references.get(string_address, []):
+                if reference.get("kind") == "literal_pair":
+                    reference_address = cls._query_address(
+                        reference.get("vaddr"))
+                    if reference_address is None:
+                        continue
+                    function = functions.get(reference_address)
+                    if isinstance(function, dict):
+                        candidate_handlers.append(function)
+                    if (isinstance(function, dict) and contains_site(function)
+                        and observed_site_call(function)
+                        and observed_disassembly(site)):
+                        return {
+                            "decision": "accepted",
+                            "semantic_class": "marker_request_chain",
+                            "chain": {
+                                "request_string": text,
+                                "reference_kind": "literal_pair",
+                                "handler": function,
+                                "site_call_observed": True,
+                            },
+                        }
+                elif reference.get("kind") == "word":
+                    table_address = cls._query_address(reference.get("vaddr"))
+                    if table_address is None:
+                        continue
+                    table_words = tables.get(table_address, [])
+                    for word in table_words:
+                        value = cls._query_address(word.get("value"))
+                        if (word.get("classification") != "ascii_pointer"
+                                or value != string_address):
+                            continue
+                        for handler_word in table_words:
+                            if handler_word.get("classification") != \
+                                    "executable_pointer":
+                                continue
+                            handler = cls._query_address(
+                                handler_word.get("value"))
+                            if handler is None:
+                                continue
+                            function = handler_word.get("function")
+                            if not isinstance(function, dict):
+                                function = functions.get(handler)
+                            if isinstance(function, dict):
+                                candidate_handlers.append(function)
+                            if (isinstance(function, dict)
+                                    and contains_site(function)
+                                    and observed_site_call(function)
+                                    and observed_disassembly(site)):
+                                return {
+                                    "decision": "accepted",
+                                    "semantic_class": "marker_request_chain",
+                                    "chain": {
+                                        "request_string": text,
+                                        "reference_kind": "word_table",
+                                        "handler": function,
+                                        "site_call_observed": True,
+                                    },
+                                }
+        missing: list[str] = []
+        if not ascii_addresses:
+            missing.append("confirmed_request_string")
+        if not any(references.get(address) for address in ascii_addresses):
+            missing.append("request_data_reference")
+        if not any(
+                any(word.get("classification") == "ascii_pointer"
+                    and cls._query_address(word.get("value")) in ascii_addresses
+                    for word in tables.get(address, []))
+                for reference_address in
+                [cls._query_address(reference.get("vaddr"))
+                 for address in ascii_addresses
+                 for reference in references.get(address, [])
+                 if reference.get("kind") == "word"]
+                for address in [reference_address or -1]):
+            missing.append("handler_table_context")
+        unique_handlers = {
+            (function.get("start"), function.get("end")): function
+            for function in candidate_handlers
+            if isinstance(function, dict)
+        }
+        candidate_handlers = list(unique_handlers.values())
+        if candidate_handlers:
+            containing = [function for function in candidate_handlers
+                          if contains_site(function)]
+            if not containing:
+                return {
+                    "decision": "rejected",
+                    "semantic_class": "marker_handler_does_not_contain_site",
+                    "required": (
+                        "The registered site must be inside a handler recovered "
+                        "from a confirmed request string's reference/table; "
+                        "choose an exact call in that handler"),
+                }
+            if not any(observed_site_call(function)
+                       for function in containing):
+                missing.append("exact_site_in_function_calls")
+            if not observed_disassembly(site):
+                missing.append("disassemble_exact_site")
+        else:
+            missing.append("recovered_handler")
+        return {
+            "decision": "deferred",
+            "semantic_class": "marker_request_chain_incomplete",
+            "missing_evidence": missing,
+            "required": (
+                "Complete the chain with decisive read-only queries: "
+                "ascii_search a confirmed request path/form-field string; "
+                "follow its data_reference; recover the handler from a "
+                "literal pair or data_table_context; use function_calls with "
+                "contains/paging when the handler is large; and disassemble "
+                "the exact registered site before concluding"),
+        }
+
+    def _site_eligibility(self, entry: dict, fault: dict, session) -> dict:
+        eligibility = self._semantic_site_eligibility(entry, fault)
+        marker = self._marker_site_evidence_eligibility(
+            entry, fault, session, self.reproduction, self.plan)
+        command_sink = (
+            self._command_marker_sink_eligibility(entry)
+            if fault.get("outcome") == "command_injection_marker" else None
+        )
+        if command_sink is not None and command_sink.get("decision") in {
+                "rejected", "deferred"}:
+            return command_sink
+        if marker.get("decision") in {"rejected", "deferred"}:
+            return marker
+        if marker.get("semantic_class") != "not_marker_fault":
+            eligibility["marker_evidence_chain"] = marker
+        return eligibility
+
+    @staticmethod
+    def _fault_prompt_view(fault: dict) -> dict:
+        view = {key: fault.get(key) for key in (
+            "request", "signal", "debug_context", "marker", "outcome", "protocol")}
+        if view.get("signal") is None:
+            del view["signal"]
+        context = view.get("debug_context")
+        if not isinstance(context, dict) or not context:
+            exit_record = fault.get("exit_record")
+            if isinstance(exit_record, dict):
+                context = exit_record.get("debug_context")
+        view["debug_context"] = _fault_context_for_prompt(context)
+        return view
 
     def _collect_candidate_runtime_exits(self, cursor: int | None,
                                          candidate_sha: str | None) -> list[dict]:
@@ -797,7 +1734,7 @@ class FirmwareWorkflow:
         contract["response_schema"] = {"evidence": ["<evidence id>"], "reasoning": "<text>"}
         contract["forbidden_top_level_keys"] = ["op", "query", "queries", "model_code_site", "localization_conclusion"]
         contract["rule"] = "A patch site passed nomination; return only the final conclusion"
-        fault_view = {key: fault.get(key) for key in ("request", "signal", "debug_context")}
+        fault_view = self._fault_prompt_view(fault)
         return {"task": stage, "registered_patch_sites": [site], "fault": fault_view,
                 "conclusion_required": contract}
 
@@ -868,8 +1805,12 @@ class FirmwareWorkflow:
         for evidence_id in code_sites:
             entry = ledger.get(evidence_id)
             if ledger.code_site_rejected(evidence_id):
-                raise RepairError("model_output_invalid",
-                                  "localization cites rejected nomination evidence")
+                rejection = ledger.nomination_decision(evidence_id)
+                raise RepairError(
+                    "model_output_invalid",
+                    "localization cites rejected nomination evidence "
+                    f"({rejection.get('semantic_class')}); select a different "
+                    "site and register it in this session")
             answer = registered[evidence_id]
             if answer.get("site") != entry.get("site") or \
                     answer.get("bytes_hex") != entry.get("bytes_hex"):
@@ -880,15 +1821,26 @@ class FirmwareWorkflow:
         selected_sites = []
         for evidence_id in code_sites:
             entry = ledger.get(evidence_id)
-            eligibility = self._semantic_site_eligibility(entry, fault)
-            if eligibility.get("decision") == "rejected":
-                if not ledger.code_site_rejected(evidence_id):
+            eligibility = self._site_eligibility(entry, fault, session)
+            if eligibility.get("decision") in {"rejected", "deferred"}:
+                if (eligibility.get("decision") == "rejected"
+                        and not ledger.code_site_rejected(evidence_id)):
+                    ledger.reject_code_site(
+                        evidence_id, session_id=session.session_id,
+                        semantic_class=eligibility["semantic_class"])
+                if eligibility.get("decision") == "deferred":
+                    ledger.defer_code_site(
+                        evidence_id, session_id=session.session_id,
+                        semantic_class=eligibility["semantic_class"],
+                        missing=eligibility.get("missing_evidence", []))
+                elif not ledger.code_site_rejected(evidence_id):
                     ledger.reject_code_site(
                         evidence_id, session_id=session.session_id,
                         semantic_class=eligibility["semantic_class"])
                 raise RepairError(
                     "model_output_invalid",
-                    "cited patch site was rejected by the semantic nomination gate")
+                    "cited patch site was not accepted by the semantic "
+                    "nomination gate")
             selected_sites.append({
                 "evidence": evidence_id, "site": entry["site"],
                 "bytes_hex": entry["bytes_hex"],
@@ -983,6 +1935,8 @@ class FirmwareWorkflow:
             "firmware_decisive_site_inspections", 2))
         decisive_site_discoveries = int(self.cfg["repair"].get(
             "firmware_decisive_site_discoveries", 2))
+        pagination_budget = max(0, int(self.cfg["repair"].get(
+            "firmware_pagination_queries", 8)))
         ledger = self.ledger_for_target()
         diagnostics = self._diagnostic_access()
         with ElfAnalysis(self.ledger_for_target().target_path) as analysis, \
@@ -1066,8 +2020,13 @@ class FirmwareWorkflow:
                       "reuse those aliases instead of converting decimal "
                       "addresses by hand. "
                       "When you have independently chosen an exact redirectable "
-                      "call site, submit it with register_patch_site. Only after "
-                      "that query succeeds, return ONE JSON object: "
+                      "call site, submit its initial lw $t9 instruction with "
+                      "register_patch_site; for a function_calls answer, that "
+                      "is a redirectable entry's vaddr, not the later jalr or "
+                      "delay slot. Entries marked redirectable=false are call "
+                      "context only and cannot be registered. Only after that "
+                      "query succeeds, return ONE JSON "
+                      "object: "
                       '{"evidence": ["e3", ...], "reasoning": "..."} citing '
                       "at least one returned model_code_site evidence id. "
                     "Watch localization_budget. When it approaches exhaustion, "
@@ -1090,10 +2049,7 @@ class FirmwareWorkflow:
                     ],
                 } if diagnostics is not None else {"available": False}),
                 "localization": localization_payload,
-                "fault": {"request": fault["request"],
-                          "signal": fault["signal"],
-                          "debug_context": _fault_context_for_prompt(
-                              fault_context)},
+                "fault": self._fault_prompt_view(fault),
                 "poc_evidence": {
                     "source": poc_text,
                     "contract": (
@@ -1103,8 +2059,115 @@ class FirmwareWorkflow:
                 },
                 "query_history": prior_history,
             }
+            if isinstance(fault.get("marker"), dict) and fault["marker"]:
+                payload["marker_localization_strategy"] = {
+                    "purpose": (
+                        "Connect confirmed request strings and fields to the "
+                        "handler and an exact redirectable interception site."),
+                    "suggested_readonly_path": [
+                        "ascii_search the distinctive URL basename and form "
+                        "field names observed in the confirmed request",
+                        "data_references each discovered string address",
+                        "for literal_pair references, run containing_function "
+                        "on the reference and then function_calls",
+                        "for word references, run data_table_context on the "
+                        "reference address; find the word equal to the "
+                        "original string address and nearby executable "
+                        "pointers, which are candidate handlers",
+                        "run function_calls on each candidate handler address "
+                        "before the query budget is exhausted; when a list is "
+                        "truncated, either continue exactly at next_offset or "
+                        "narrow it with a decisive contains filter",
+                        "For a command-injection marker, the first handler "
+                        "query should normally be function_calls with "
+                        "contains=system; only broaden to _system/popen/exec "
+                        "tokens or an unfiltered page when that decisive "
+                        "filter is empty",
+                        "disassemble candidate data-flow and command-execution "
+                        "calls; prefer a site where a small leaf can validate "
+                        "or transform attacker-controlled data while preserving "
+                        "the original return value needed by later control flow",
+                        "Compare three interception layers: input lookup, "
+                        "current-state lookup, and the behavior-critical sink. "
+                        "A fabricated input return or sink no-op can break a "
+                        "valid request; an intermediate state-read return can "
+                        "often bypass only the vulnerable action",
+                        "register the vaddr from a selected function_calls "
+                        "entry only when redirectable is true; it is the "
+                        "initial lw $t9 instruction of the canonical 16-byte "
+                        "sequence",
+                        "register_patch_site only after the request-to-call "
+                        "evidence identifies an exact site",
+                    ],
+                    "rules": [
+                        "These are query suggestions, not supplied answers or "
+                        "candidate addresses",
+                        "Do not infer causality from a callee name alone",
+                        "For a marker fault, the selected site must be reached "
+                        "from a confirmed request path/form-field string "
+                        "through a handler function, and function_calls must "
+                        "contain that exact site",
+                        "Budget the investigation: after a data table exposes "
+                        "an executable handler pointer, function_calls on that "
+                        "handler is the next decisive query. Do not spend the "
+                        "remaining budget on broad config-string sweeps",
+                        "For a command-injection marker, once a handler is "
+                        "recovered, first query function_calls with a narrow "
+                        "contains filter for command-execution callee names; "
+                        "use a broad page only if no decisive filter is "
+                        "supported, and continue next_offset pages instead of "
+                        "repeating the same broad query",
+                        "Do not repeat a function_calls query with identical "
+                        "parameters. A cached reply is returned without new "
+                        "evidence and still consumes the finite query budget",
+                        "The controller enforces the preceding candidate-rule: "
+                        "until every executable handler recovered beside a "
+                        "confirmed request string has a function_calls result, "
+                        "unrelated disassembly and register_patch_site are "
+                        "rejected without consuming the query budget",
+                        "A behavior-critical sink such as a command or storage "
+                        "call may be unsafe to replace with a no-op if normal "
+                        "requests depend on its effect; collect enough call "
+                        "context to preserve valid behavior or choose an "
+                        "earlier data-flow site",
+                        "If the evidence chain remains incomplete, report "
+                        "localization failure instead of guessing",
+                    ],
+                }
             if feedback is not None:
                 payload["feedback"] = feedback
+            runtime_probe_results: list[dict] = []
+            runtime_probe_candidates = self._runtime_probe_candidate_sinks(
+                ledger, feedback, fault)
+            runtime_probe_eligible = (
+                stage == "relocalize"
+                or (stage == "localize"
+                    and fault.get("outcome") == "command_injection_marker"
+                    and len(runtime_probe_candidates) >= 2))
+            if runtime_probe_candidates and runtime_probe_eligible:
+                probe_root = self.root / "runtime-sink-probes"
+                attempt = len([
+                    item for item in probe_root.glob("*")
+                    if item.is_dir()])
+                runtime_probe_results = self._runtime_sink_probe(
+                    feedback, runtime_probe_candidates,
+                    probe_root / f"{attempt + 1:03d}")
+            if runtime_probe_results:
+                payload["runtime_sink_probes"] = [{
+                    "diagnostic_only": True,
+                    "notice": ("A fixed wrapper was deployed on the private "
+                               "session copy and rolled back. It is not a "
+                               "repair candidate and does not replace fresh "
+                               "register_patch_site."),
+                    **{key: item.get(key) for key in (
+                        "site", "site_hex", "callee", "source_evidence",
+                        "status", "marker_blocked", "marker_present",
+                        "stable_identity", "evidence")},
+                    "failure_kind": item.get("failure_kind"),
+                    "failed_steps": item.get("failed_steps", []),
+                } for item in runtime_probe_results]
+            initial_runtime_probe_done = bool(runtime_probe_results) or (
+                stage != "localize")
             session = EvidenceSession(
                 ledger, analysis,
                 trace_path=self.root / "evidence" / "query-trace.jsonl",
@@ -1114,19 +2177,134 @@ class FirmwareWorkflow:
                 candidate_analysis=candidate_analysis,
                 candidate_sha256=candidate_sha256,
                 diagnostics=diagnostics)
+            marker_coverage = self._marker_handler_coverage(
+                fault, self.reproduction, self.plan, session.answers,
+                fallback_request=fault.get("request"))
+
+            def run_initial_runtime_probe_if_ready() -> None:
+                """Probe after model evidence, once handler coverage is closed."""
+                nonlocal initial_runtime_probe_done
+                if initial_runtime_probe_done:
+                    return
+                coverage = refresh_marker_coverage()
+                if coverage.get("active") and coverage.get("uncovered_addresses"):
+                    return
+                if fault.get("outcome") != "command_injection_marker":
+                    return
+                candidates = self._runtime_probe_candidate_sinks(
+                    ledger, feedback, fault)
+                if len(candidates) < 2:
+                    return
+                probe_root = self.root / "runtime-sink-probes"
+                attempt = len([
+                    item for item in probe_root.glob("*")
+                    if item.is_dir()])
+                results = self._runtime_sink_probe(
+                    feedback, candidates, probe_root / f"{attempt + 1:03d}")
+                initial_runtime_probe_done = True
+                payload["runtime_sink_probes"] = [{
+                    "diagnostic_only": True,
+                    "notice": ("A fixed wrapper was deployed on the private "
+                               "session copy and rolled back. It is not a "
+                               "repair candidate and does not replace fresh "
+                               "register_patch_site."),
+                    **{key: item.get(key) for key in (
+                        "site", "site_hex", "callee", "source_evidence",
+                        "status", "marker_blocked", "marker_present",
+                        "stable_identity", "evidence")},
+                        "failure_kind": item.get("failure_kind"),
+                        "failed_steps": item.get("failed_steps", []),
+                } for item in results]
             queries = 0
+            pagination_used = 0
             turns = 0
             output_failures = 0
             length_recovery_used = False
             compact_length_mode = False
             no_progress_turns = 0
             registration_decision_failures = 0
+            registration_recovery_required = False
             conclusion_failures = 0
             nomination_locked = False
             forced_registration_reason: str | None = None
             focus_checkpoint_reason: str | None = None
             known_memory_call_sites: dict[int, str] = {}
             inspected_memory_call_sites: dict[int, dict] = {}
+            deferred_nominations: dict[int, dict] = {}
+
+            def refresh_marker_coverage() -> dict:
+                """Refresh mandatory handler checks after every new answer."""
+                nonlocal marker_coverage
+                marker_coverage = self._marker_handler_coverage(
+                    fault, self.reproduction, self.plan, session.answers,
+                    fallback_request=fault.get("request"))
+                return marker_coverage
+
+            def deferred_nomination_gate(query: dict) -> dict | None:
+                """Reject a repeated deferred site until its evidence changes.
+
+                Registration is not a read-only investigation.  Re-submitting
+                the same incomplete nomination burned the finite query budget in
+                real relocalization runs.  Re-evaluate the earlier site entry:
+                if decisive queries completed the chain, permit the new
+                registration; otherwise return the exact missing evidence.
+                """
+                if query.get("op") != "register_patch_site":
+                    return None
+                address = self._query_address(query.get("address"))
+                previous = deferred_nominations.get(address or -1)
+                if address is None or previous is None:
+                    return None
+                eligibility = self._site_eligibility(
+                    previous.get("entry") or {}, fault, session)
+                if eligibility.get("decision") not in {"deferred", "rejected"}:
+                    del deferred_nominations[address]
+                    return None
+                error = {
+                    "stage": stage,
+                    "error": (
+                        "Patch-site nomination was already deferred and its "
+                        "required evidence is still incomplete"),
+                    "submitted_query": EvidenceSession.compact_query(query),
+                    "semantic_eligibility": eligibility,
+                    "previous_missing_evidence": previous.get("missing", []),
+                    "rule": (
+                        "Do not submit the same deferred address again. Run "
+                        "only the decisive read-only query implied by "
+                        "missing_evidence, then nominate that address or a "
+                        "different site"),
+                    "budget_charged": False,
+                }
+                session.record_rejection(query, RepairError(
+                    "model_output_invalid", error["error"]))
+                return error
+
+            def pagination_continuation(query: dict) -> bool:
+                """Recognize the next page of an already returned filtered list.
+
+                This is deliberately narrow: it does not make arbitrary repeated
+``` searches free and does not skip a query that narrows or broadens the filter.
+                """
+                if query.get("op") != "function_calls" or query.get("offset") is None:
+                    return False
+                for previous in reversed(session.answers):
+                    if not isinstance(previous, dict):
+                        continue
+                    prior_query = previous.get("query")
+                    prior_answer = previous.get("answer")
+                    if not isinstance(prior_query, dict) or not isinstance(prior_answer, dict):
+                        continue
+                    if prior_query.get("op") != "function_calls":
+                        continue
+                    if (prior_query.get("address") == query.get("address")
+                            and prior_query.get("site") == query.get("site")
+                            and prior_query.get("function") == query.get("function")
+                            and prior_query.get("contains") == query.get("contains")):
+                        if prior_answer.get("next_offset") == query.get("offset"):
+                            return True
+                        if prior_answer.get("next_offset") is not None:
+                            return False
+                return False
 
             def checkpoint_after_model_evidence() -> None:
                 """Focus investigation after broad model-side discoveries."""
@@ -1211,12 +2389,28 @@ class FirmwareWorkflow:
                     raise RepairError(
                         "stage_timeout",
                         f"{stage} exceeded its firmware stage time budget")
-                final_conclusion_turn = queries >= budget
+                marker_coverage_pending = bool(
+                    marker_coverage.get("active")
+                    and marker_coverage.get("uncovered_addresses"))
+                if (registration_recovery_required
+                        and not marker_coverage_pending):
+                    # A deferred nomination has a concrete read-only gap.  A
+                    # registration-only turn here creates contradictory
+                    # instructions when the gap is disassembly or handler
+                    # coverage; let the model execute that evidence first.
+                    final_conclusion_turn = False
+                final_conclusion_turn = (
+                    queries >= budget and not marker_coverage_pending)
+                if registration_recovery_required:
+                    final_conclusion_turn = False
                 conclusion_only = conclusion_pending and (
                     nomination_locked or final_conclusion_turn or payload_budget_exhausted)
                 registration_decision = not conclusion_pending and (
                     final_conclusion_turn
-                    or forced_registration_reason is not None)
+                    or forced_registration_reason is not None) \
+                    and not marker_coverage_pending
+                if registration_recovery_required:
+                    registration_decision = False
                 previous_registration_error = payload.get("registration_error")
                 if registration_decision:
                     payload = _registration_decision_payload(
@@ -1241,6 +2435,7 @@ class FirmwareWorkflow:
                                if key not in {"localization_budget",
                                               "budget_directive",
                                               "focus_checkpoint",
+                                              "marker_handler_coverage",
                                               "registration_decision_required",
                                               "registration_error"}}
                     remaining_queries = max(0, budget - queries)
@@ -1249,11 +2444,19 @@ class FirmwareWorkflow:
                         "query_budget": budget,
                         "queries_used": queries,
                         "queries_remaining": remaining_queries,
+                        "pagination_budget": pagination_budget,
+                        "pagination_used": pagination_used,
                         "turn_budget": max_turns,
                         "turns_used": turns,
                         "turns_remaining": max(0, max_turns - turns),
                         "final_decision_reserved_after_query_budget": True,
                     }
+                    if marker_coverage_pending:
+                        payload["marker_handler_coverage"] = {
+                            key: value for key, value in marker_coverage.items()
+                            if key != "active"
+                        }
+                        payload["marker_handler_coverage"]["active"] = True
                     if 0 < remaining_queries <= batch_size:
                         payload["budget_directive"] = {
                             "stage": stage,
@@ -1422,6 +2625,11 @@ class FirmwareWorkflow:
                                 "The final decision turn accepts only one "
                                 "register_patch_site query or an explicit "
                                 "localization_failed conclusion")
+                        deferred_gate = deferred_nomination_gate(
+                            decision_queries[0])
+                        if deferred_gate is not None:
+                            raise RepairError(
+                                "model_output_invalid", deferred_gate["error"])
                         answer = session.handle(decision_queries[0])
                     except RepairError as exc:
                         registration_decision_failures += 1
@@ -1443,7 +2651,28 @@ class FirmwareWorkflow:
                         }
                         continue
                     entry = ledger.get(answer.get("evidence")) or {}
-                    eligibility = self._semantic_site_eligibility(entry, fault)
+                    eligibility = self._site_eligibility(entry, fault, session)
+                    if eligibility.get("decision") == "deferred":
+                        ledger.defer_code_site(
+                            answer["evidence"], session_id=session.session_id,
+                            semantic_class=eligibility["semantic_class"],
+                            missing=eligibility.get("missing_evidence", []))
+                        session.record_rejection(data, RepairError(
+                            "model_output_invalid",
+                            "site nomination needs more evidence"))
+                        payload["registration_error"] = {
+                            "stage": stage,
+                            "error": ("Patch-site nomination needs more "
+                                      "evidence before it can be accepted"),
+                            "semantic_eligibility": eligibility,
+                            "rule": (
+                                "Resume decisive read-only queries listed in "
+                                "missing_evidence, then register the same or a "
+                                "better site"),
+                        }
+                        forced_registration_reason = None
+                        registration_recovery_required = True
+                        continue
                     if eligibility.get("decision") == "rejected":
                         ledger.reject_code_site(
                             answer["evidence"], session_id=session.session_id,
@@ -1453,14 +2682,16 @@ class FirmwareWorkflow:
                             "model_output_invalid", "semantic site gate rejected nomination"))
                         if registration_decision_failures >= 2:
                             raise RepairError("localization_failed", "semantic site gate rejected repeated final nominations")
-                        payload["registration_error"] = {
+                        registration_feedback = {
                             "stage": stage,
                             "error": "Patch-site nomination rejected by semantic gate",
                             "semantic_eligibility": eligibility,
                         }
+                        payload["registration_error"] = registration_feedback
                         forced_registration_reason = (
                             "The previous nomination was rejected by the "
                             "semantic gate")
+                        registration_recovery_required = False
                         continue
                     conclusion_pending = True
                     registration_answer = answer
@@ -1526,6 +2757,22 @@ class FirmwareWorkflow:
                         break
                     continue
                 if model_queries is None:
+                    refresh_marker_coverage()
+                    marker_gate = self._marker_handler_gate(
+                        {"op": "localization_conclusion"}, marker_coverage)
+                    if marker_gate is not None:
+                        session.record_rejection(data, RepairError(
+                            "model_output_invalid",
+                            marker_gate["error"]))
+                        payload = {
+                            key: value for key, value in payload.items()
+                            if key not in {"query_answer", "query_answers",
+                                           "query_error",
+                                           "conclusion_error"}
+                        }
+                        payload["query_error"] = marker_gate
+                        note_no_progress()
+                        continue
                     try:
                         self._write_localization(
                             data, session, query_history=prior_history,
@@ -1575,23 +2822,61 @@ class FirmwareWorkflow:
                 turn_answers = []
                 query_error = None
                 remaining = budget - queries
-                bounded_queries = model_queries[:min(batch_size, remaining)]
-                batch_truncated = len(model_queries) > len(bounded_queries)
+                executable_queries = []
+                for query in model_queries:
+                    if len(executable_queries) >= max(
+                            1, min(batch_size, remaining)):
+                        break
+                    executable_queries.append(query)
+                batch_truncated = len(model_queries) > len(executable_queries)
                 turn_progress = False
                 batch_start = len(session.answers)
-                for query in bounded_queries:
+                for query in executable_queries:
+                    refresh_marker_coverage()
+                    marker_gate = self._marker_handler_gate(
+                        query, marker_coverage)
+                    deferred_gate = deferred_nomination_gate(query)
+                    if (marker_gate is None and registration_recovery_required
+                            and query.get("op") != "register_patch_site"):
+                        marker_gate = self._registration_recovery_gate(
+                            query, deferred_nominations, session.answers)
+                    if (marker_gate is None and registration_recovery_required
+                            and deferred_gate is not None):
+                        marker_gate = {
+                            **deferred_gate,
+                            "stage_category": "registration_recovery_required",
+                        }
+                    if marker_gate is not None:
+                        # Controller-directed coverage is not a model-chosen
+                        # discovery query and must not consume the finite
+                        # localization budget.  Keep the rejection auditable.
+                        session.record_rejection(query, RepairError(
+                            "model_output_invalid", marker_gate["error"]))
+                        query_error = marker_gate
+                        break
+                    if deferred_gate is not None:
+                        query_error = deferred_gate
+                        break
                     # Every submitted query consumes the deterministic budget,
                     # including contract-invalid queries.
-                    queries += 1
+                    if (pagination_continuation(query)
+                            and pagination_used < pagination_budget):
+                        pagination_used += 1
+                    else:
+                        queries += 1
                     try:
                         answer = session.handle(query)
                         turn_answers.append(answer)
                         observe_decision_evidence(query, answer)
+                        refresh_marker_coverage()
+                        if answer.get("op") == "function_calls":
+                            run_initial_runtime_probe_if_ready()
                         if answer.get("cached") is not True:
                             turn_progress = True
                         if answer.get("op") == "register_patch_site":
                             entry = ledger.get(answer.get("evidence"))
-                            eligibility = self._semantic_site_eligibility(entry or {}, fault)
+                            eligibility = self._site_eligibility(
+                                entry or {}, fault, session)
                             if eligibility.get("decision") == "rejected":
                                 ledger.reject_code_site(
                                     answer["evidence"], session_id=session.session_id,
@@ -1602,6 +2887,38 @@ class FirmwareWorkflow:
                                     "submitted_query": EvidenceSession.compact_query(query),
                                     "semantic_eligibility": eligibility,
                                 }
+                                break
+                            if eligibility.get("decision") == "deferred":
+                                ledger.defer_code_site(
+                                    answer["evidence"],
+                                    session_id=session.session_id,
+                                    semantic_class=eligibility[
+                                        "semantic_class"],
+                                    missing=eligibility.get(
+                                        "missing_evidence", []))
+                                nomination_site = entry.get("site") if isinstance(
+                                    entry, dict) else None
+                                if type(nomination_site) is int:
+                                    deferred_nominations[nomination_site] = {
+                                        "entry": entry,
+                                        "missing": eligibility.get(
+                                            "missing_evidence", []),
+                                    }
+                                query_error = {
+                                    "stage": stage,
+                                    "error": ("Patch-site nomination needs "
+                                              "more evidence before it can "
+                                              "be accepted"),
+                                    "submitted_query": EvidenceSession.compact_query(query),
+                                    "semantic_eligibility": eligibility,
+                                    "rule": (
+                                        "Run only the decisive read-only "
+                                        "queries listed in missing_evidence, "
+                                        "then register the same or a better "
+                                        "site"),
+                                }
+                                forced_registration_reason = None
+                                registration_recovery_required = True
                                 break
                             conclusion_pending = True
                             registration_answer = answer
@@ -1670,6 +2987,19 @@ class FirmwareWorkflow:
                                               "query_error",
                                               "conclusion_error",
                                               "output_retry"}}
+                    if registration_recovery_required:
+                        # Keep the explicit recovery instruction alongside the
+                        # normal budget; this is deliberately not a
+                        # registration-only turn.
+                        payload["registration_recovery"] = {
+                            "stage": stage,
+                            "rule": (
+                                "Run only the decisive read-only query implied "
+                                "by missing_evidence (for example exact-site "
+                                "disassembly or an uncovered handler's "
+                                "function_calls), then register that site or a "
+                                "better one"),
+                        }
                     if len(turn_answers) == 1:
                         payload["query_answer"] = turn_answers[0]
                     elif turn_answers:
@@ -1696,6 +3026,9 @@ class FirmwareWorkflow:
                            if key not in {"query_answer", "query_answers",
                                           "query_error",
                                           "conclusion_error", "output_retry"}}
+                if registration_recovery_required:
+                    payload.pop("registration_recovery", None)
+                    registration_recovery_required = False
                 if len(turn_answers) == 1:
                     payload["query_answer"] = turn_answers[0]
                 elif turn_answers:
@@ -1717,7 +3050,7 @@ class FirmwareWorkflow:
         """Let the model re-investigate after a failed candidate."""
         self._localize_round(
             stage="relocalize", budget=int(self.cfg["repair"].get(
-                "firmware_relocalize_queries", 8)),
+                "firmware_relocalize_queries", 16)),
             feedback=feedback, query_history=self.localization_queries(),
             candidate=candidate, candidate_sha256=candidate_sha256)
 
@@ -1757,11 +3090,48 @@ class FirmwareWorkflow:
     def _restart_on_baseline(self, expected_sha: str | None = None) -> None:
         if self.control is None:
             return
-        self.control.restart(transaction=self.lock.id)
+        try:
+            self._restart_baseline_once(expected_sha)
+        except RepairError as first_exc:
+            failure = getattr(first_exc, "failure", None)
+            if not (isinstance(failure, dict)
+                    and failure.get("kind") == "target_start_failed"):
+                raise
+            # A pre-candidate baseline launch can hit a transient rehost
+            # startup race. Retry exactly once and retain the first evidence.
+            # Candidate replace/restart paths deliberately do not use this
+            # helper: a pre-ready candidate exit is candidate behavior and
+            # must remain available to failure triage/relocalization.
+            first_exit = failure.get("exit")
+            self.report.setdefault("warnings", []).append({
+                "stage": "baseline-restart",
+                "category": "target_start_failed",
+                "attempt": 1,
+                "retried": True,
+                "reason": failure.get("reason"),
+                "launch_id": failure.get("launch_id"),
+                "expected_sha256": failure.get("expected_sha256"),
+                **({"exit": self._neutral_launch_exit(first_exit)}
+                   if isinstance(first_exit, dict) else {}),
+            })
+            save_json(self.root / "report.json", self.report)
+            self._restart_baseline_once(expected_sha)
+
+    def _restart_baseline_once(self, expected_sha: str | None) -> None:
+        self.control.restart(transaction=self.lock.id if self.lock else None)
         if expected_sha is not None and self.control.target_sha() != expected_sha:
             raise RepairError("integrity_failed",
                               "Service restart after reproduction changed "
                               "the target bytes")
+
+    def _baseline_target_is_live(self, expected_sha: str) -> bool:
+        """Whether a readiness-registered baseline instance can be reused."""
+        if self.control is None:
+            return False
+        try:
+            return self.control.current_target().get("sha256") == expected_sha
+        except (RepairError, OSError):
+            return False
 
     def reproduce(self) -> None:
         """One plan execution against the live service (kept as a stage
@@ -1780,11 +3150,7 @@ class FirmwareWorkflow:
         # The confirmed fault killed the service; restart on the SAME bytes
         # so later stages (test baseline oracle) run against a live service.
         baseline_sha = self.reproduction["target_start"]["sha256"]
-        self.control.restart(transaction=self.lock.id)
-        if self.control.target_sha() != baseline_sha:
-            raise RepairError("integrity_failed",
-                              "Service restart after reproduction changed "
-                              "the target bytes")
+        self._restart_on_baseline(expected_sha=baseline_sha)
 
     def ledger_for_target(self) -> EvidenceLedger:
         fw = self.cfg["firmware"]
@@ -1803,7 +3169,11 @@ class FirmwareWorkflow:
         fw = self.cfg["firmware"]
         note = (f"Operator fixed checks: {len(fw['checks'])} configured "
                 "(never model-generated)")
-        payload = tests_prompt(self.reproduction, note)
+        payload = tests_prompt(self.reproduction, note, self.plan)
+        trigger_scenarios = required_trigger_scenarios(
+            self.reproduction, self.plan)
+        test_reasoning_effort = self.cfg["repair"].get(
+            "firmware_test_reasoning_effort", "low")
         attempts = []
         for attempt in range(1, MAX_TEST_ATTEMPTS + 1):
             data = None
@@ -1812,8 +3182,10 @@ class FirmwareWorkflow:
                                 self.root / "test-generation" / str(attempt),
                                 max_output_tokens=int(self.cfg["repair"].get(
                                     "firmware_conclusion_max_output_tokens",
-                                    24576)))
-                tests = validate_tests(data)
+                                    24576)),
+                                reasoning_effort=test_reasoning_effort)
+                tests = validate_tests(
+                    data, required_trigger_scenarios=trigger_scenarios)
                 public_tests, holdout_tests = split_holdouts(tests)
                 canonical_tests = public_tests + holdout_tests
                 # Baseline oracle on the ORIGINAL firmware.
@@ -1833,6 +3205,7 @@ class FirmwareWorkflow:
                 if exc.status == "infrastructure_failed":
                     raise
                 feedback = self.feedback("generate-tests", exc, attempts, data)
+                last_error = f"{exc.status}: {str(exc)}"
                 # Concrete per-test baseline observations (actual status
                 # codes, actual exits) so the model can re-derive correct
                 # expectations instead of guessing statuses/lengths.
@@ -1849,11 +3222,21 @@ class FirmwareWorkflow:
                              "reason": r.get("reason")}
                             for r in oracle.get("results", [])]
                         feedback["baseline_observations"] = observations
+                        if any(item.get("expect") == "pass"
+                               and item.get("reason") == "marker_not_created"
+                               for item in observations):
+                            feedback["test_design_rule"] = (
+                                "A pass test cannot replay the confirmed "
+                                "malicious marker trigger. Make the final "
+                                "control input valid; marker creation belongs "
+                                "only to a vulnerability marker test")
                     except ValueError:
                         pass
                 payload = {**payload, "feedback": feedback}
-        raise RepairError("contract_information_required",
-                          "Model tests failed baseline oracle repeatedly")
+        raise RepairError(
+            "contract_information_required",
+            "Model tests failed validation or baseline oracle repeatedly; "
+            f"last error: {last_error}")
 
     @staticmethod
     def _fault_signature(record: dict | None) -> dict:
@@ -1896,14 +3279,119 @@ class FirmwareWorkflow:
             category = "new_fault_introduced"
         else:
             category = "same_fault_unfixed"
+        verification_class = getattr(exc, "verification_class", None)
+        if verification_class is not None:
+            category = verification_class
         return {"category": category, "retry_scope": "relocalize",
                 "baseline_signature": base_sig, "candidate_signature": cand_sig}
+
+    _WRAPPER_REFINABLE_CATEGORIES = frozenset({
+        "functional_regression",
+        "pre_trigger_functional_failure",
+        "pre_trigger_transport_failure",
+        "trigger_functional_failure",
+        "trigger_transport_failure",
+    })
+
+    @classmethod
+    def _wrapper_same_site_refinement(cls, proposal: dict | None,
+                                      triage: dict,
+                                      refinements_used: int) -> dict | None:
+        """Grant one source-only correction for a wrapper candidate.
+
+        A wrapper already preserves the original callee.  If verification
+        shows that its decision predicate damaged a required normal request
+        or failed to block the marker, the call layer is usually still correct
+        and only ``repair_entry`` needs correction.  This is not a generic
+        retry: leaf proposals and a second wrapper failure continue through
+        the historical relocalization policy.
+        """
+        edits = proposal.get("edits") if isinstance(proposal, dict) else None
+        if not isinstance(edits, list) or not edits:
+            return None
+        if any(edit.get("mode", "leaf") != "wrapper"
+               for edit in edits if isinstance(edit, dict)):
+            return None
+        if triage.get("category") not in cls._WRAPPER_REFINABLE_CATEGORIES:
+            return None
+        if refinements_used >= 1:
+            return None
+        refined = [
+            {"site": edit["site"], "mode": "wrapper"}
+            for edit in edits
+            if isinstance(edit, dict) and type(edit.get("site")) is int
+        ]
+        if not refined:
+            return None
+        return {
+            "controller_required_edits": refined,
+            "wrapper_refinement": {
+                "attempt": refinements_used + 1,
+                "reason_category": triage.get("category"),
+                "rule": (
+                    "Keep every wrapper site and mode fixed. Correct only "
+                    "repair_entry's decision predicate; return semantic "
+                    "rejection only if this call layer cannot preserve "
+                    "required behavior"),
+            },
+        }
+
+    @staticmethod
+    def _candidate_replay_feedback(replay: dict, plan: dict) -> list[dict]:
+        """Return path-free behavior facts for model relocalization.
+
+        The repair model needs to distinguish a broken pre-trigger login from
+        a blocked trigger and a failed post-trigger control request.  Raw
+        response bytes and local logs stay in the controller evidence files.
+        """
+        steps = plan.get("requests")
+        steps = steps if isinstance(steps, list) else []
+        trigger_index = next(
+            (index for index, item in enumerate(steps)
+             if isinstance(item, dict)
+             and item.get("expect") == "marker_created"), None)
+        feedback = []
+        for result in replay.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            index = next(
+                (i for i, item in enumerate(steps)
+                 if isinstance(item, dict)
+                 and item.get("id") == result.get("id")), None)
+            if index is None:
+                position = "unknown"
+            elif trigger_index is None:
+                position = "post_trigger"
+            elif index < trigger_index:
+                position = "pre_trigger"
+            elif index == trigger_index:
+                position = "trigger"
+            else:
+                position = "post_trigger"
+            delivery = result.get("delivery")
+            marker_after = result.get("marker_after")
+            feedback.append({
+                "id": result.get("id"),
+                "status": result.get("status"),
+                "reason": result.get("reason"),
+                "expect": steps[index].get("expect", "response")
+                          if index is not None and isinstance(steps[index], dict)
+                          else None,
+                "phase_position": position,
+                "http_status": result.get("http_status"),
+                "receive": delivery.get("receive")
+                           if isinstance(delivery, dict) else None,
+                "marker_present": bool(marker_after.get("exists"))
+                                   if isinstance(marker_after, dict) else None,
+            })
+        return feedback
 
     def repair_rounds(self) -> None:
         max_rounds = min(
             int(self.cfg["repair"]["max_rounds"]),
             int(self.cfg["repair"].get("firmware_max_rounds", 3)))
         feedback = None
+        semantic_rejections = 0
         for number in range(1, max_rounds + 1):
             self.check_deadline()
             # Each proposal/build round gets its own budget. Candidate
@@ -1924,6 +3412,55 @@ class FirmwareWorkflow:
                 for proposal_cycle in range(1, MAX_REPAIR_PROPOSAL_CYCLES + 1):
                     proposal = self.propose(round_dir, proposal_feedback,
                                             deadline=repair_deadline)
+                    if isinstance(proposal, dict) \
+                            and proposal.get("edits") == [] \
+                            and "rejection_reason" in proposal:
+                        localization = json.loads(
+                            (self.root / "localize" / "result.json")
+                            .read_text(encoding="utf-8"))
+                        selected_evidence = set(localization.get("evidence", []))
+                        selected_sites = {
+                            site.get("site")
+                            for site in localization.get("selected_sites", [])
+                            if isinstance(site, dict)
+                            and site.get("evidence") in selected_evidence
+                        }
+                        if not selected_sites:
+                            raise RepairError(
+                                "integrity_failed",
+                                "Localization result has no selected patch site")
+                        semantic_rejections += 1
+                        if semantic_rejections > 1:
+                            raise RepairError(
+                                "localization_failed",
+                                "Repeated semantic rejection consumed the "
+                                "relocalization allowance without a "
+                                "deployable site")
+                        repeated = selected_sites & self._semantically_rejected_sites
+                        if repeated:
+                            raise RepairError(
+                                "model_output_invalid",
+                                "Semantic rejection repeated for a previously "
+                                "rejected localization site; relocalize must "
+                                "select fresh evidence")
+                        self._semantically_rejected_sites.update(selected_sites)
+                        rejection = {
+                            "stage": "repair",
+                            "category": "site_semantics_rejected",
+                            "error": proposal["rejection_reason"][:2000],
+                            "retry_scope": "relocalize",
+                        }
+                        record["site_semantics_rejected"] = rejection
+                        save_json(round_dir / "proposal.json", proposal)
+                        record["status"] = "site_semantics_rejected"
+                        record["error"] = proposal["rejection_reason"][:4000]
+                        self.report["rounds"].append(record)
+                        save_json(round_dir / "record.json", record)
+                        self._invalidate_localization(
+                            "The selected site was semantically rejected by "
+                            "the repair proposal")
+                        feedback = rejection
+                        break
                     try:
                         built = self.implant(proposal, round_dir,
                                              deadline=repair_deadline)
@@ -1937,6 +3474,21 @@ class FirmwareWorkflow:
                         record["contract_failures"] = list(contract_failures)
                         if proposal_cycle == MAX_REPAIR_PROPOSAL_CYCLES:
                             raise
+                if built is None:
+                    if record.get("status") == "site_semantics_rejected":
+                        if number >= max_rounds:
+                            continue
+                        try:
+                            self.relocalize(
+                                feedback, candidate=None, candidate_sha256=None)
+                        except RepairError as loc_exc:
+                            record["relocalize_status"] = loc_exc.status
+                            record["relocalize_error"] = str(loc_exc)[:4000]
+                            save_json(round_dir / "record.json", record)
+                            raise
+                        continue
+                    raise RepairError(
+                        "repair_invalid", "No deployable candidate was built")
                 candidate_sha = built.get("record", {}).get("candidate_sha256")
                 exit_cursor = self._runtime_exit_cursor()
                 outcome = self.deploy_and_verify(built, round_dir)
@@ -1946,6 +3498,15 @@ class FirmwareWorkflow:
                 save_json(round_dir / "record.json", record)
                 return
             except RepairError as exc:
+                if exc.status in {"localization_failed",
+                                  "localization_output_invalid"} \
+                        and candidate_sha is None:
+                    # These failures happen before a candidate exists.  They
+                    # must not trigger candidate-exit observation, rollback,
+                    # or repair feedback meant for a deployed binary.
+                    self.report["rounds"].append(record)
+                    save_json(round_dir / "record.json", record)
+                    raise
                 launch_exit = self._candidate_launch_evidence(
                     exc, candidate_sha) if exc.status == "infrastructure_failed" \
                     else None
@@ -2011,6 +3572,15 @@ class FirmwareWorkflow:
                                        exit_cursor, candidate_sha))
                 debug_context = self._fault_context_from_exits(candidate_exits)
                 triage = self._candidate_failure_triage(exc, candidate_exits)
+                wrapper_refinement = self._wrapper_same_site_refinement(
+                    proposal, triage, self._wrapper_same_site_refinements)
+                if wrapper_refinement is not None:
+                    self._wrapper_same_site_refinements += 1
+                    triage = {
+                        **triage,
+                        **wrapper_refinement,
+                        "retry_scope": "same_localization",
+                    }
                 record["failure_triage"] = triage
                 # Candidate failed verification: build feedback and persist
                 # the round before rollback mutates target/runtime evidence.
@@ -2021,6 +3591,16 @@ class FirmwareWorkflow:
                 if exc.status in {"functional_failed", "verification_failed",
                                   "generated_test_failed"}:
                     feedback["failure_triage"] = triage
+                    if wrapper_refinement is not None:
+                        feedback.update(wrapper_refinement)
+                        feedback["rule"] = wrapper_refinement[
+                            "wrapper_refinement"]["rule"]
+                        feedback["previous_sources"] = [
+                            edit.get("source")
+                            for edit in proposal.get("edits", [])
+                            if isinstance(edit, dict)
+                            and isinstance(edit.get("source"), str)
+                        ]
                     feedback["retry_scope"] = triage["retry_scope"]
                     feedback["rule"] = {
                         "same_fault_unfixed": (
@@ -2035,6 +3615,40 @@ class FirmwareWorkflow:
                         "functional_regression": (
                             "Keep the independently selected site and restore "
                             "normal-path behavior"),
+                        "pre_trigger_transport_failure": (
+                            "The candidate blocked a required request before "
+                            "the confirmed trigger. Re-investigate the same "
+                            "request-to-handler chain across three layers: "
+                            "argument/input lookup, current-state lookup, and "
+                            "the behavior-critical sink. Avoid both returning "
+                            "a fabricated input value and replacing the sink "
+                            "when normal requests depend on its effect; prefer "
+                            "an intermediate state-read site whose benign "
+                            "return naturally bypasses the vulnerable action "
+                            "while preserving the response path"),
+                        "marker_still_created": (
+                            "The previous wrapper did not intercept the "
+                            "confirmed marker. Treat that call site as wrong "
+                            "or unreachable for this request flow; re-run "
+                            "decisive function_calls queries on the recovered "
+                            "handler and register a different command sink. "
+                            "Do not merely correct the old predicate"),
+                        "pre_trigger_functional_failure": (
+                            "The candidate changed a required pre-trigger "
+                            "response. Preserve normal request semantics while "
+                            "blocking only the confirmed malicious trigger"),
+                        "trigger_transport_failure": (
+                            "The candidate made the confirmed trigger request "
+                            "fail without producing the allowed verdict. "
+                            "Re-examine the input, state, and sink layers and "
+                            "preserve valid behavior while blocking the side "
+                            "effect"),
+                        "trigger_functional_failure": (
+                            "The candidate changed the confirmed trigger "
+                            "request semantics without cleanly blocking the "
+                            "marker side effect. Compare the three call layers "
+                            "and choose a site whose benign behavior remains "
+                            "observable"),
                     }.get(triage["category"],
                           "Re-investigate the candidate behavior from evidence")
                     feedback["error"] = (
@@ -2058,9 +3672,9 @@ class FirmwareWorkflow:
                 if replay_path.is_file():
                     try:
                         replay = json.loads(replay_path.read_text())
-                        feedback["candidate_replay"] = [
-                            {"id": r["id"], "status": r["status"]}
-                            for r in replay.get("results", [])]
+                        feedback["candidate_replay"] = \
+                            self._candidate_replay_feedback(
+                                replay, self.plan)
                     except ValueError:
                         pass
                 tests_path = round_dir / "verify" / "tests" / "test-results.json"
@@ -2077,6 +3691,14 @@ class FirmwareWorkflow:
                     feedback["candidate_runtime_exits"] = candidate_exits
                 if debug_context is not None:
                     feedback["fault_context"] = debug_context
+                if triage.get("category") == "marker_still_created":
+                    feedback["failed_wrapper_sites"] = [
+                        {"site": edit.get("site"), "mode": edit.get("mode", "leaf")}
+                        for edit in (proposal.get("edits", [])
+                                     if isinstance(proposal, dict) else [])
+                        if isinstance(edit, dict)
+                        and edit.get("mode", "leaf") == "wrapper"
+                    ]
                 self.report["rounds"].append(record)
                 save_json(round_dir / "record.json", record)
                 rollback_ok = self._rollback_preserving_primary(
@@ -2221,29 +3843,58 @@ class FirmwareWorkflow:
             self.deadline, deadline)
         repair_max_tokens = int(self.cfg["repair"].get(
             "firmware_repair_max_output_tokens", 32768))
+        repair_reasoning_effort = self.cfg["repair"].get(
+            "firmware_repair_reasoning_effort", "low")
         payload = {"prompt": proposal_prompt(
             proposal_view, fault, rounds_left=max_rounds -
             int(round_dir.name) + 1),
             "localization_result": localization,
             "public_tests": self.tests,
             "feedback": feedback}
-        # Two attempts: a contract violation gets one format-feedback retry
-        # (real models occasionally add explanatory keys or miss fields).
+        # Format/schema violations are local to proposal generation and do not
+        # consume a deployment round. A semantic rejection is deliberately a
+        # separate controller decision, not an ordinary validator failure.
         attempts = []
         model_dir = round_dir / "model"
         existing = [int(path.name) for path in model_dir.iterdir()
                     if path.is_dir() and path.name.isdigit()] \
             if model_dir.is_dir() else []
         first_attempt = max(existing, default=0) + 1
+        required_edits = None
+        if isinstance(feedback, dict):
+            controller_required = feedback.get("controller_required_edits")
+            if isinstance(controller_required, list):
+                required_edits = controller_required
         for attempt in range(1, 3):
             if time.monotonic() >= stage_deadline:
                 raise RepairError(
                     "stage_timeout",
                     "repair exceeded its firmware stage time budget")
-            data = self.ask("repair", payload, round_dir / "model" /
-                            str(first_attempt + attempt - 1),
-                            deadline=stage_deadline,
-                            max_output_tokens=repair_max_tokens)
+            try:
+                data = self.ask("repair", payload, round_dir / "model" /
+                                str(first_attempt + attempt - 1),
+                                deadline=stage_deadline,
+                                max_output_tokens=repair_max_tokens,
+                                reasoning_effort=repair_reasoning_effort)
+            except RepairError as exc:
+                if exc.status != "model_output_invalid":
+                    raise
+                attempts.append(str(exc)[:600])
+                if attempt == 2:
+                    raise
+                payload = {**payload,
+                           "feedback": {
+                               "stage": "repair",
+                               "category": "proposal_format",
+                               "error": str(exc)[:600],
+                               "rule": "Return one compact strict JSON object "
+                                       "matching the proposal or semantic "
+                                       "rejection schema",
+                               "previous_attempts": attempts}}
+                if required_edits is not None:
+                    payload["feedback"][
+                        "controller_required_edits"] = required_edits
+                continue
             try:
                 proposal = validate_proposal(data, ledger)
                 for edit in proposal["edits"]:
@@ -2262,6 +3913,24 @@ class FirmwareWorkflow:
                             "model_output_invalid",
                             "edit must match and cite a model_code_site "
                             "selected by the current localization result")
+                if required_edits is not None:
+                    required = [
+                        {"site": item.get("site"),
+                         "mode": item.get("mode", "leaf")}
+                        for item in required_edits if isinstance(item, dict)
+                    ]
+                    actual = [
+                        {"site": edit.get("site"),
+                         "mode": edit.get("mode", "leaf")}
+                        for edit in proposal["edits"]
+                    ]
+                    if actual != required:
+                        raise RepairError(
+                            "model_output_invalid",
+                            "Controller requires the previous wrapper sites "
+                            "unchanged with mode=wrapper; use semantic "
+                            "rejection only when that call layer cannot "
+                            "preserve required behavior")
                 return proposal
             except RepairError as exc:
                 if exc.status == "infrastructure_failed":
@@ -2279,6 +3948,9 @@ class FirmwareWorkflow:
                                                 "expected_hex, evidence, "
                                                 "contract, source.",
                                         "previous_attempts": attempts}}
+                if required_edits is not None:
+                    payload["feedback"][
+                        "controller_required_edits"] = required_edits
 
     def implant(self, proposal: dict, round_dir: Path, *,
                 deadline: float | None = None) -> dict:
@@ -2329,17 +4001,19 @@ class FirmwareWorkflow:
                               "Deployed target sha differs from candidate")
         logs = round_dir / "verify"
         full_observation = float(fw["poc_request_timeout"])
-        exploratory_observation = min(
-            full_observation,
-            float(self.cfg["repair"].get(
-                "firmware_exploratory_observation_seconds", 5)))
         verification = verify_candidate(
             self.control, checks=fw["checks"], plan=self.plan,
             tests=self.tests, logs=logs,
-            exit_timeout=exploratory_observation,
+            # Functional verdicts must use the same transport budget as the
+            # confirmed reproduction.  A shorter exploratory window mislabeled
+            # slow-but-valid command side effects as candidate failures.
+            exit_timeout=full_observation,
             transaction=transaction, deadline=self.deadline)
         return {"candidate_sha256": built["record"]["candidate_sha256"],
-                "exploratory_observation_seconds": exploratory_observation,
+                "observation_seconds": full_observation,
+                # Legacy report field: consumers still treat this as the
+                # candidate verification window.
+                "exploratory_observation_seconds": full_observation,
                 "verification": {"fixed": verification["fixed"]["passed"],
                                  "replay_stable": verification["replay"]["stable_identity"],
                                  "tests": verification["tests"]}}
@@ -2750,7 +4424,9 @@ def verify_firmware_run(root: Path) -> dict:
                           "Stored run config has no firmware section")
     try:
         from .case import _validate_checks
-        _validate_checks(fw.get("checks"))
+        _validate_checks(fw.get("checks"),
+                         protocol=fw.get("protocol",
+                                         HTTP_ASCII_GET_HEAD_PORT80))
     except RepairError as exc:
         raise RepairError("integrity_failed",
                           "Stored fixed checks failed validation") from exc

@@ -21,7 +21,7 @@
 | 案例 | 固件 / CVE | 当前分类 | 状态 |
 |---|---|---|---|
 | [dlink/dir825b-2.03/cve-2025-6291/](dlink/dir825b-2.03/cve-2025-6291/README.md) | D-Link DIR-825 B 2.03 / CVE-2025-6291 | `validated` | 0.3.0 真实路线 A 已达到 `validated_candidate` |
-| [dlink/dir825b-2.03/cve-2024-57595/](dlink/dir825b-2.03/cve-2024-57595/README.md) | D-Link DIR-825 B 2.03 / CVE-2024-57595 | `controller-reproduce-validated` | 已验证 8 字节受限 marker PoC 和控制器 doctor/marker reproduce；等待模型修复闭环 |
+| [dlink/dir825b-2.03/cve-2024-57595/](dlink/dir825b-2.03/cve-2024-57595/README.md) | D-Link DIR-825 B 2.03 / CVE-2024-57595 | `validated` | 0.3.0 真实模型定位 + wrapper 修复达到 `validated_candidate`，独立 verify 为 `verified_with_cleanup_warnings` |
 
 ## 案例卡写作规范
 
@@ -44,8 +44,8 @@
   README.md                 团队案例卡与复现步骤
   poc/                      可分享的声明式 PoC 输入
   config/                   可分享的 case/intake 模板
-  patches/                  模型生成的修复源码或补丁说明
-  results/                  脱敏结果摘要、PoC 计划、生成测试与候选身份
+  patches/                  模型生成的修复源码、proposal、patch record、候选摘要与补丁身份
+  results/                  脱敏 JSON 摘要：PoC 计划、生成测试、定位、候选验证、run 报告与独立验证
 ```
 
-整理完成的 case 不把原始固件、完整 rootfs、完整模型响应或 `repair-results/` 提交到 Git。官方 ZIP 可留在被忽略的 `archive/inputs/`；完整 rootfs 和大型过程产物应在结果摘要整理完成后清理。确认 `results/result-summary.json` 已记录最新成功 run ID、控制器版本、候选 SHA256、测试结果和独立验证结论后，即可清理对应的临时实验目录；固件需要复核时按案例卡给出的官方地址重新下载并校验 SHA256。
+整理完成的 case 不把原始固件、完整 rootfs、生成配置、HTML 报告、个人路径或 `repair-results/` 提交到 Git；patches 和 results 中只保留 JSON 摘要与文本证据，不提交补丁二进制或对象文件。官方 ZIP 可留在被忽略的 `archive/inputs/`；完整 rootfs 和大型过程产物应在结果摘要整理完成后清理。确认 `results/result-summary.json` 已记录最新成功 run ID、控制器版本、候选 SHA256、测试结果和独立验证结论后，即可清理对应的临时实验目录；固件需要复核时按案例卡给出的官方地址重新下载并校验 SHA256。

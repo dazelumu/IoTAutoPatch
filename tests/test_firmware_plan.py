@@ -66,6 +66,14 @@ def test_plan_prompt_contains_poc_and_channel_only():
     payload = plan_prompt("print('x')", "note")
     assert payload["poc_source"] == "print('x')"
     assert "declarative HTTP requests" in payload["instruction"]
+    assert '"marker": "/absolute/path"' in payload["instruction"]
+    assert "never marker_path" in payload["instruction"]
+    assert "The list is named requests, never steps" in payload["instruction"]
+    assert "A POST body is named form, never fields" in payload["instruction"]
+    assert "that plan is authoritative" in payload["instruction"]
+    assert "preserving every step" in payload["instruction"]
+    assert "accept_timeout=true" in payload["instruction"]
+    assert "stable_identity=true" in payload["instruction"]
     assert "same prefix and suffix" in payload["instruction"]
     assert "code" not in json.dumps(payload).lower() or "Only output JSON" in payload["instruction"]
 

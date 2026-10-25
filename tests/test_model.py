@@ -55,6 +55,8 @@ def test_needs_build_change_optional_value(tmp_path, monkeypatch, value):
 @pytest.mark.parametrize("content,expected", [
     # Contract shape.
     ('{"op": "call_sites"}', {"op": "call_sites"}),
+    # Some models wrap the required object in one JSON-string layer.
+    ('"{\\"op\\": \\"call_sites\\"}"', {"op": "call_sites"}),
     # Markdown fence around the object (real run localize/1).
     ('```json\n{"query": {"op": "disassemble", "site": 42, "around": 16}}\n```',
      {"query": {"op": "disassemble", "site": 42, "around": 16}}),

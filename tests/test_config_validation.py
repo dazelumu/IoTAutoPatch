@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from repair_tool.config import RepairError, load_config, load_triage_config
+from repair_tool.config import DEFAULTS
 
 
 def write_case(tmp_path: Path, firmware: dict | None = None,
@@ -39,6 +40,19 @@ def test_nested_unknown_keys_are_rejected(tmp_path) -> None:
         complete=True)
     with pytest.raises(RepairError, match="Unknown keys in firmware.diagnostics"):
         load_config(path)
+
+
+def test_relocalize_default_budget_and_case_override(tmp_path) -> None:
+    path = write_case(tmp_path, complete=True)
+    cfg = load_config(path)
+    assert DEFAULTS["repair"]["firmware_relocalize_queries"] == 16
+    assert cfg["repair"]["firmware_relocalize_queries"] == 16
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["repair"] = {"firmware_relocalize_queries": 8}
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg["repair"]["firmware_relocalize_queries"] == 8
 
 
 def test_non_string_yaml_keys_fail_cleanly(tmp_path) -> None:

@@ -1,20 +1,16 @@
 # Project Vuln Repair 0.3.0
 
-Project Vuln Repair 是一个证据驱动的漏洞修复控制器，支持两类流程：C/C++ 源码项目修复，以及重托管 IoT 固件的路线 A 修复。控制器负责执行、证据、验收和回滚；模型只获得经过批准的分析材料，并返回受约束的提案，最终由软件自行验证。
+Project Vuln Repair 是一个证据驱动的漏洞修复控制器，目标是支持重托管 IoT 固件的漏洞修复。控制器负责执行、证据、验收和回滚；模型只获得经过批准的分析材料，并返回受约束的提案，最终由软件自行验证。
 
-长期目标是逐步扩展为面向绝大多数固件的大模型自动漏洞修复系统。当前不能这样宣称：真实端到端修复证据仍只覆盖 D-Link DIR-825 B 2.03 的 CVE-2025-6291 场景，即 MIPS32 big-endian `sbin/httpd` 栈溢出类漏洞。已验证固件/CVE 矩阵见 [docs/SUPPORTED_FIRMWARE.md](docs/SUPPORTED_FIRMWARE.md)，可迁移的案例说明见 [cases/README.md](cases/README.md)，通用化路线、阶段边界和完成标准见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+项目长期目标是逐步扩展为面向绝大多数固件的大模型自动漏洞修复系统。当前真实端到端修复验证成功了 D-Link DIR-825 B 2.03 的 CVE-2025-6291 场景，即 MIPS32 big-endian `sbin/httpd` 栈溢出类漏洞。已验证固件/CVE 矩阵见 [docs/SUPPORTED_FIRMWARE.md](docs/SUPPORTED_FIRMWARE.md)，可迁移的案例说明见 [cases/README.md](cases/README.md)，通用化路线、阶段边界和完成标准见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 当前版本：**0.3.0**。本版是当前固件管线的文档和源码树基线。当前验证边界见 [VALIDATION.md](VALIDATION.md)，架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，操作手册见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
 
 ## 功能定位
 
-### C/C++ 源码修复
+### IoT 固件路线
 
-用户提供源码项目、PoC、构建命令和测试。控制器复制项目，在隔离副本中复现故障，调用模型分析并生成补丁 proposal，再构建、测试、独立评估每个候选，最终输出可复查的报告和候选产物。原始源码目录不会被直接修改。
-
-### IoT 固件路线 A
-
-当前有真实修复闭环证据的固件只有 D-Link DIR-825 B 2.03 的 CVE-2025-6291 场景：MIPS32 big-endian/o32、目标 `sbin/httpd`、80 端口 ASCII HTTP GET/HEAD、栈溢出类致命内存破坏。0.3.0 已在同一固件的 CVE-2024-57595 命令注入案例中通过受限 HTTP 表单 POST / Cookie / 多步协议的 doctor 与 marker reproduce 验证；该新路线尚未调用模型、尚未生成候选，也尚未完成独立 verify。FirmAE 只执行 diagnostic-only 的 compatibility/analysis，导出转换后的文件系统映像；`repair intake` 校验并把该映像物化为隔离 rootfs，生成案例配置。随后控制器使用权威运行时 `native-proot-mips32be` 完成 PoC 复现、定位、测试生成、补丁植入、回滚和最终验证。
+当前有真实修复闭环证据的固件是 D-Link DIR-825 B 2.03：CVE-2025-6291 覆盖 MIPS32 big-endian/o32、`sbin/httpd`、80 端口 ASCII GET/HEAD 和栈溢出致命退出；CVE-2024-57595 覆盖同一目标上的受限表单 POST、Cookie/字段捕获、多步认证和命令注入 marker 验收。两个案例均达到 `validated_candidate`，独立 verify 均为 `verified_with_cleanup_warnings`。FirmAE 只执行 diagnostic-only 的 compatibility/analysis，导出转换后的文件系统映像；`repair intake` 校验并把该映像物化为隔离 rootfs，生成案例配置。随后控制器使用权威运行时 `native-proot-mips32be` 完成 PoC 复现、定位、测试生成、补丁植入、回滚和最终验证。
 
 交互式路线 A 向导会逐步引导输入检查、FirmAE analysis、intake、doctor、真实模型修复、报告查看和可选独立验证。第 5 步会向模型服务商外发数据，必须输入大写 `YES`。
 
@@ -46,7 +42,7 @@ Project Vuln Repair 是一个证据驱动的漏洞修复控制器，支持两类
 | Greenhouse | 仅 diagnostic-only adapter 契约；真实 CLI 兼容性未验证 |
 | 漏洞类型 | 仅真实验证栈溢出类致命内存破坏；堆溢出、UAF、格式化字符串等未验证 |
 
-后续按 `docs/ROADMAP.md` 的 P1–P6 推进：先泛化输入与诊断，再扩展架构族、runtime、协议和漏洞类型，最后建立批量评测。同固件的 CVE-2024-57595 命令注入已经完成受控 PoC 方法验证和控制器 doctor/marker reproduce；下一步是模型定位、候选修复和独立 verify。任何新固件都必须同时满足 [docs/SUPPORTED_FIRMWARE.md](docs/SUPPORTED_FIRMWARE.md) 的入库标准，获得提取、启动、协议、架构、定位、补丁、回滚、独立 verify 和真实 `validated_candidate` 证据后，才进入“已支持”清单。
+后续按 `docs/ROADMAP.md` 的 P1–P6 推进：先泛化输入与诊断，再扩展架构族、runtime、协议和漏洞类型，最后建立批量评测。CVE-2024-57595 已完成模型定位、wrapper 修复、候选验证和独立 verify。任何新固件都必须同时满足 [docs/SUPPORTED_FIRMWARE.md](docs/SUPPORTED_FIRMWARE.md) 的入库标准，获得提取、启动、协议、架构、定位、补丁、回滚、独立 verify 和真实 `validated_candidate` 证据后，才进入“已支持”清单。
 
 ## Ubuntu 快速开始
 

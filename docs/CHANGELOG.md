@@ -7,8 +7,8 @@
 - 建立当前固件管线的 0.3.0 文档和源码树基线。
 - 以两个当前支持流程重构产品说明：保留的 C/C++ 源码修复，以及 DIR-825 固件路线 A。
 - 新增中文架构说明、操作手册、变更记录和 0.3.0 发布记录。
-- 新增已验证固件/CVE 清单，明确当前唯一真实闭环样本是 DIR-825 B 2.03 的 CVE-2025-6291 栈溢出场景。
-- 新增可迁移的固件案例卡：CVE-2025-6291 登记为 `validated`；CVE-2024-57595 的 8 字节受限 marker PoC 与控制器 doctor/marker reproduce 已受控验证，登记为 `controller-reproduce-validated`，等待模型修复闭环。
+- 新增已验证固件/CVE 清单，登记 DIR-825 B 2.03 的 CVE-2025-6291 栈溢出和 CVE-2024-57595 命令注入两个真实闭环样本。
+- 新增可迁移的固件案例卡：CVE-2025-6291 登记为 `validated`；CVE-2024-57595 完成六步表单 PoC、真实模型定位、wrapper 修复、候选验证和独立 verify，登记为 `validated`。
 - 新增中文固件通用化路线图，明确最终目标、当前 DIR-825/MIPS32BE/栈溢出边界、路线 A/B/C 和 P1–P6 扩展计划。
 - 将固件运行时重构为 session / runtime / profile 三层：通用进程、HTTP 隧道和 MIPS32BE ELF 装载逻辑移出 DIR-825；DIR-825 设备知识移入 `profiles/dlink/dir825b_2_03/`，并通过封闭 profile 注册表解析。
 - 新增只读 `repair boot-plan`：扫描物化 rootfs 的常见 HTTP 服务、init 线索和 ELF 架构，输出 candidate-only 启动计划；未知设备仍不能进入权威修复。
@@ -16,7 +16,7 @@
 - 部署到 Ubuntu 24.04 WSL 固定路径后完成一次全量回归，并完成真实 DIR-825 路线 A `validated_candidate` 与独立 `verified_with_cleanup_warnings` 验证。
 - 发布包纳入精选文档；归档过期过程资料、历史 ZIP、旧任务书、实验和历史结果。
 - 优化路线 A 向导：进度面板更紧凑，菜单标注推荐项和风险项，回车执行推荐操作，inspect 完成状态可持久化；真实模型外发确认不再显示 `Y/N`，只接受大写 `YES`。
-- 权威 runtime 与架构未扩展；新表单/多步协议已完成真实 doctor/marker reproduce，尚未完成真实模型修复闭环。Greenhouse、额外架构、HTTPS/非 80 端口和真实硬件仍未验证。
+- 权威 runtime 与架构未扩展；新表单/多步协议已在 CVE-2024-57595 上完成真实模型修复闭环和独立 verify。Greenhouse、额外架构、HTTPS/非 80 端口和真实硬件仍未验证。
 
 ## 0.2.x
 

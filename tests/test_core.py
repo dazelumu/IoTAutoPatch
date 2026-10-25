@@ -36,6 +36,21 @@ def test_inline_key_loading_and_saved_config_redaction(case, monkeypatch):
     assert model_secret(cfg) == "other-env-credential"
 
 
+def test_short_inline_key_does_not_corrupt_saved_paths():
+    from repair_tool.config import public_config
+
+    cfg = {
+        "model": {"api_key": "k", "note": "k"},
+        "firmware": {"rootfs": "/home/lumu/tmp/pytest-marker-final/rootfs"},
+    }
+    saved = public_config(cfg)
+
+    assert saved["model"]["api_key"] is None
+    assert saved["model"]["note"] == "<redacted>"
+    assert saved["firmware"]["rootfs"] == (
+        "/home/lumu/tmp/pytest-marker-final/rootfs")
+
+
 def test_localization_failure_uses_repair_exit_code():
     from repair_tool.cli import exit_code
 
@@ -137,6 +152,9 @@ def test_config_resolves_against_yaml(case, monkeypatch, tmp_path):
     assert cfg["project"]["path"] == str(project)
     assert cfg["repair"]["max_rounds"] == 5
     assert cfg["repair"]["firmware_query_max_output_tokens"] == 32768
+    assert cfg["repair"]["firmware_poc_reasoning_effort"] == "low"
+    assert cfg["repair"]["firmware_test_reasoning_effort"] == "low"
+    assert cfg["repair"]["firmware_repair_reasoning_effort"] == "low"
     assert cfg["repair"]["firmware_query_reasoning_effort"] == "low"
     assert cfg["repair"][
         "firmware_length_recovery_reasoning_effort"] == "low"
@@ -242,6 +260,9 @@ def test_empty_software_config_is_optional(case, monkeypatch, tmp_path):
     ("model", "stream", "true"), ("model", "total_timeout_seconds", 0),
     ("model", "reasoning_effort", {}),
     ("repair", "firmware_query_reasoning_effort", "medium"),
+    ("repair", "firmware_poc_reasoning_effort", "medium"),
+    ("repair", "firmware_test_reasoning_effort", "medium"),
+    ("repair", "firmware_repair_reasoning_effort", "medium"),
     ("repair", "firmware_query_reasoning_effort", "xhigh"),
     ("repair", "firmware_length_recovery_reasoning_effort", "medium"),
     ("repair", "firmware_registration_reasoning_effort", "medium"),

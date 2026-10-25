@@ -81,7 +81,8 @@ FirmAE 与 Greenhouse 是诊断后端。它们可以提供事实，但当前不�
 
 当前注册两个封闭协议：
 
-- `http-ascii-get-head-port80`：有界 ASCII GET/HEAD，无请求体。这是当前唯一有真实修复闭环证据的协议。
+- `http-ascii-get-head-port80`：有界 ASCII GET/HEAD，无请求体，已有 CVE-2025-6291 真实修复闭环证据。
+- `http-ascii-auth-form-multi-step-port80`：有界 ASCII GET/POST、表单编码、有限 Cookie/字段捕获和多步认证，已有 CVE-2024-57595 真实修复闭环证据。
 - `http-ascii-auth-form-multi-step-port80`：有界 ASCII GET/HEAD/POST、固定 `application/x-www-form-urlencoded` 表单、有限 Cookie 捕获/重放、声明式隐藏字段捕获和多步请求。它用于命令注入类副作用复现，尚未完成真实修复闭环。
 
 POST 表单由驱动统一 URL 编码并计算 `Content-Length`；模型和 operator 都不能提供原始 body、任意 header 或网络脚本。多步执行器只捕获显式声明的 HTML input 字段和 Set-Cookie，后续请求只能引用这些已捕获值。
@@ -104,6 +105,14 @@ POST 表单由驱动统一 URL 编码并计算 `Content-Length`；模型和 oper
 - 每个定位/重定位会话都要求新鲜注册。
 
 控制器不会在定位中注入已知答案、候选地址列表、函数名或补丁模板。
+
+### Runtime sink differential probe
+
+当一个已确认的命令注入 marker 存在多个候选 command sink 时，控制器可以在私有 session 副本上执行有界差分探测。候选只来自模型已经收到并保存在 evidence ledger 中的 `function_calls` 答案，且必须是 redirectable command-execution 调用；真实候选反馈或此前差分探针已证明 marker 未被拦截的 wrapper site 会被排除。首轮定位阶段会在 marker handler 覆盖完成且模型已看到至少两个候选 sink 后动态执行一次；重定位阶段仍可在候选失败后使用剩余候选继续探测。
+
+每个探测使用控制器固定生成的诊断 wrapper，不接受模型提供的判定代码。控制器部署该 wrapper 后，从已验证计划的第一步开始重放认证、字段捕获、cookie 等前置状态，直到确认的 marker 触发步骤；不能只发送最终触发请求。探测观察 marker 是否消失、目标身份是否稳定，然后立即回滚 baseline。回滚失败按基础设施失败处理，不能被后续探测掩盖。
+
+探测结论分为三类：`marker_blocked=true` 是决定性诊断证据；`marker_present=true` 表示该 wrapper 未拦截当前触发流；认证、传输或会话建立失败属于 `transport_or_session_failure`，结果必须记录为 `inconclusive`，不能被表述为“未阻断”。同一探测阶段出现这种场景失败时停止消耗后续候选 sink。提供给模型和写入 evidence 的结论都包含 `failure_kind` 与具体失败步骤，不能只传布尔值。探测结果写入 evidence ledger 和 run 工件，并作为诊断事实提供给模型；它不是修复候选，也不能替代模型在同一会话中新鲜执行 `register_patch_site`。默认每个探测阶段最多探测 3 个 site，找到有效拦截点后停止。
 
 ## 验证
 

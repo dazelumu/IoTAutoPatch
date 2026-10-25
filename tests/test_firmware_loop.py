@@ -304,6 +304,27 @@ def test_validate_tests_accepts_and_rejects():
         validate_tests(missing_independent)
 
 
+def test_pass_tests_cannot_reuse_confirmed_trigger():
+    trigger = {"method": "GET", "path": "/" + "A" * 205 + ".gif"}
+    data = {
+        "tests": [
+            {"id": "bad-pass", "kind": "independent", "expect": "pass",
+             "basis": "incorrectly reuses the trigger",
+             "request": dict(trigger),
+             "response": {"statuses": [200], "contains": ""}},
+            {"id": "trigger", "kind": "vulnerability", "expect": "fatal_exit",
+             "basis": "confirmed trigger", "request": dict(trigger)},
+            {"id": "normal", "kind": "regression", "expect": "pass",
+             "basis": "normal behavior", "request": {"method": "GET", "path": "/"},
+             "response": {"statuses": [200], "contains": "home"}},
+        ]
+    }
+
+    with pytest.raises(RepairError, match="bad-pass.*confirmed malicious"):
+        validate_tests(data, required_trigger_scenarios=[
+            {"request": trigger}])
+
+
 def test_generate_tests_uses_one_canonical_order(fake_session, tmp_path):
     session, adapter = fake_session
     poc = tmp_path / "canonical-tests-poc.py"
@@ -348,6 +369,180 @@ def test_operator_checks_are_gated_on_original_baseline(fake_session,
     with pytest.raises(RepairError) as caught:
         flow.validate_baseline_checks()
     assert caught.value.status == "baseline_checks_failed"
+
+
+def test_baseline_checks_reuse_ready_baseline_without_extra_restart(
+        tmp_path, monkeypatch):
+    import repair_tool.firmware.loop as loop_mod
+
+    poc = tmp_path / "reuse-baseline-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, tmp_path / "unused-rootfs", poc)
+    flow.baseline_bytes.parent.mkdir(parents=True, exist_ok=True)
+    flow.baseline_bytes.write_bytes(b"baseline")
+    baseline_sha = _sha_bytes(b"baseline")
+
+    class Control:
+        def __init__(self):
+            self.restarts = 0
+
+        def current_target(self):
+            return {"pid": 21, "sha256": baseline_sha,
+                    "program": "/sbin/httpd"}
+
+        def target_sha(self):
+            return self.current_target()["sha256"]
+
+        def restart(self, transaction=None):
+            self.restarts += 1
+            return {"ok": True}
+
+    control = Control()
+    flow.control = control
+    monkeypatch.setattr(
+        loop_mod, "run_fixed_checks",
+        lambda *_, **__: {"passed": True, "results": []})
+
+    flow.validate_baseline_checks()
+
+    assert control.restarts == 0
+    assert flow.report["baseline_checks"]["passed"] is True
+
+
+def test_baseline_checks_restart_when_live_target_is_wrong(
+        tmp_path, monkeypatch):
+    import repair_tool.firmware.loop as loop_mod
+
+    poc = tmp_path / "wrong-baseline-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, tmp_path / "unused-rootfs", poc)
+    flow.baseline_bytes.parent.mkdir(parents=True, exist_ok=True)
+    flow.baseline_bytes.write_bytes(b"baseline")
+    baseline_sha = _sha_bytes(b"baseline")
+    class Control:
+        def __init__(self):
+            self.restarts = 0
+
+        def current_target(self):
+            if self.restarts == 0:
+                return {"pid": 21, "sha256": "candidate", "program": "/x"}
+            return {"pid": 22, "sha256": baseline_sha, "program": "/sbin/httpd"}
+
+        def target_sha(self):
+            return self.current_target()["sha256"]
+
+        def restart(self, transaction=None):
+            self.restarts += 1
+            return {"ok": True}
+
+    control = Control()
+    flow.control = control
+    monkeypatch.setattr(
+        loop_mod, "run_fixed_checks",
+        lambda *_, **__: {"passed": True, "results": []})
+
+    flow.validate_baseline_checks()
+
+    assert control.restarts == 1
+    assert control.current_target()["sha256"] == baseline_sha
+
+
+def test_baseline_restart_retries_one_target_start_failure(tmp_path):
+    poc = tmp_path / "baseline-retry-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, tmp_path / "unused-rootfs", poc)
+    flow.baseline_bytes.parent.mkdir(parents=True, exist_ok=True)
+    flow.baseline_bytes.write_bytes(b"baseline")
+    baseline_sha = _sha_bytes(b"baseline")
+    calls = {"restarts": 0}
+
+    class Control:
+        def restart(self, transaction=None):
+            calls["restarts"] += 1
+            if calls["restarts"] == 1:
+                exc = RepairError(
+                    "infrastructure_failed",
+                    "Admin RPC restart: Target exited before readiness")
+                exc.failure = {
+                    "kind": "target_start_failed",
+                    "reason": "target exited before readiness",
+                    "launch_id": "launch-3",
+                    "expected_sha256": baseline_sha,
+                    "exit": {
+                        "pid": 1299,
+                        "signal_name": "SIGSEGV",
+                        "phase": "starting",
+                        "identity_confirmed": False,
+                        "debug_context": {"pc": 0x40daec, "ra": 0x40acc4,
+                                          "log_path": "/tmp/private.log"},
+                        "log_path": "/tmp/private.log",
+                    },
+                }
+                raise exc
+            return {"ok": True}
+
+        def target_sha(self):
+            return baseline_sha
+
+    flow.control = Control()
+    flow._restart_on_baseline(expected_sha=baseline_sha)
+
+    assert calls["restarts"] == 2
+    warning = flow.report["warnings"][0]
+    assert warning["stage"] == "baseline-restart"
+    assert warning["retried"] is True
+    assert warning["exit"]["debug_context"] == {
+        "pc": 0x40daec, "ra": 0x40acc4}
+    assert "/tmp/" not in json.dumps(warning)
+
+
+def test_baseline_restart_does_not_retry_non_start_or_repeated_failure(
+        tmp_path):
+    poc = tmp_path / "baseline-no-retry-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, tmp_path / "unused-rootfs", poc)
+    flow.baseline_bytes.parent.mkdir(parents=True, exist_ok=True)
+    flow.baseline_bytes.write_bytes(b"baseline")
+    baseline_sha = _sha_bytes(b"baseline")
+
+    class NonStartControl:
+        def __init__(self):
+            self.restarts = 0
+
+        def restart(self, transaction=None):
+            self.restarts += 1
+            raise RepairError("infrastructure_failed", "socket vanished")
+
+        def target_sha(self):
+            return baseline_sha
+
+    non_start = NonStartControl()
+    flow.control = non_start
+    with pytest.raises(RepairError, match="socket vanished"):
+        flow._restart_on_baseline(expected_sha=baseline_sha)
+    assert non_start.restarts == 1
+
+    class RepeatedStartControl:
+        def __init__(self):
+            self.restarts = 0
+
+        def restart(self, transaction=None):
+            self.restarts += 1
+            exc = RepairError(
+                "infrastructure_failed", "Target exited before readiness")
+            exc.failure = {"kind": "target_start_failed",
+                           "reason": "target exited before readiness"}
+            raise exc
+
+        def target_sha(self):
+            return baseline_sha
+
+    repeated = RepeatedStartControl()
+    flow.control = repeated
+    with pytest.raises(RepairError, match="Target exited"):
+        flow._restart_on_baseline(expected_sha=baseline_sha)
+    assert repeated.restarts == 2
+    assert len(flow.report["warnings"]) == 1
 
 
 def test_baseline_oracle_and_verdict(fake_session, tmp_path):
@@ -481,6 +676,10 @@ def _add_model_code_site(ledger, *, site=0x400000,
 
 def _mark_localization_valid(flow, result: dict):
     result = {**result, "target_sha256": flow.ledger_for_target().target_sha}
+    result.setdefault("selected_sites", [
+        {"evidence": evidence, "site": 0x400000, "bytes_hex": "11" * 16}
+        for evidence in result.get("evidence", [])
+    ])
     save_json(flow.root / "localize" / "result.json", result)
     flow.localization_valid = True
     save_json(flow.root / "evidence" / "localization-state.json", {
@@ -547,8 +746,8 @@ def test_poc_and_test_generation_use_conclusion_output_cap(
     captured = []
 
     def bounded_ask(stage, payload, directory, *, deadline=None,
-                    max_output_tokens=None):
-        captured.append((stage, max_output_tokens))
+                    max_output_tokens=None, reasoning_effort=None):
+        captured.append((stage, max_output_tokens, reasoning_effort))
         return copy.deepcopy(PLAN_REPLY if stage == "poc-analysis"
                              else TESTS_REPLY)
 
@@ -559,8 +758,8 @@ def test_poc_and_test_generation_use_conclusion_output_cap(
     flow.generate_tests()
 
     assert captured == [
-        ("poc-analysis", 6789),
-        ("generate-tests", 6789),
+        ("poc-analysis", 6789, "low"),
+        ("generate-tests", 6789, "low"),
     ]
 
 
@@ -602,6 +801,61 @@ def test_propose_uses_firmware_repair_stage_budget(fake_session, tmp_path):
     assert captured["max_output_tokens"] == 12345
     assert captured["deadline"] <= time.monotonic() + 7
     assert captured["deadline"] <= flow.deadline
+
+
+def _set_repair_localization(flow, result: dict):
+    _mark_localization_valid(flow, result)
+
+
+def test_propose_retries_model_json_error_inside_stage(fake_session, tmp_path):
+    session, adapter = fake_session
+    poc = tmp_path / "proposal-format-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    ledger = flow.ledger_for_target()
+    selected = _add_model_code_site(ledger)
+    result = {"evidence": [selected], "reasoning": "selected", "queries": []}
+    _set_repair_localization(flow, result)
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "request": {"method": "GET", "path": "/trigger"},
+        "signal": "SIGSEGV", "exit_record": {"pid": 10}})
+    contract = {"abi": "inferred", "bounds": "bounded",
+                "preserve": "valid control response",
+                "invalid": "block confirmed trigger"}
+    valid = {"edits": [{
+        "site": 0x400000, "expected_hex": "11" * 16,
+        "evidence": [selected], "contract": contract,
+        "source": "int repair_entry(void *p) { return p != 0; }"}]}
+
+    class FormattingModel(ScriptedModel):
+        def ask(self, stage, payload, directory, **kwargs):
+            self.calls.append({"stage": stage, "payload": payload})
+            queue = self.replies.get(stage)
+            if not queue:
+                raise RepairError(
+                    "infrastructure_failed", "no scripted reply")
+            reply = queue.pop(0)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "prompt.json").write_text(json.dumps(payload)[:4000])
+            if isinstance(reply, RepairError):
+                raise reply
+            return copy.deepcopy(reply)
+
+    flow.model = FormattingModel(flow.cfg, flow.root)
+    flow.model.script(
+        "repair",
+        RepairError("model_output_invalid", json.dumps({
+            "error": "Expecting ',' delimiter", "line": 1, "column": 42})),
+        valid)
+
+    proposal = flow.propose(tmp_path / "rounds" / "001", None)
+
+    assert proposal["edits"][0]["site"] == 0x400000
+    assert len(flow.model.calls) == 2
+    retry_feedback = flow.model.calls[1]["payload"]["feedback"]
+    assert retry_feedback["category"] == "proposal_format"
+    assert retry_feedback["error"].startswith("{\"error\"")
 
 
 def test_firmware_round_cap_and_shared_repair_deadline(tmp_path, monkeypatch):
@@ -668,7 +922,7 @@ def test_repair_stage_timeout_is_terminal_and_keeps_original_status(
     assert relocalize == []
 
 
-def test_candidate_iteration_uses_short_observation_window(
+def test_candidate_iteration_uses_full_request_observation_window(
         fake_session, tmp_path, monkeypatch):
     session, adapter = fake_session
     poc = tmp_path / "short-window-poc.py"
@@ -693,8 +947,9 @@ def test_candidate_iteration_uses_short_observation_window(
 
     outcome = flow.deploy_and_verify(built, tmp_path / "short-window-round")
 
-    assert observed["exit_timeout"] == 2.0
-    assert outcome["exploratory_observation_seconds"] == 2.0
+    assert observed["exit_timeout"] == 10.0
+    assert outcome["observation_seconds"] == 10.0
+    assert outcome["exploratory_observation_seconds"] == 10.0
 
 
 def test_implant_rejects_full_target_drift_before_build(fake_session,
@@ -735,6 +990,7 @@ def test_localize_registers_model_selected_site_and_keeps_history(
     flow = make_workflow(tmp_path, rootfs, poc,
                          analysis_target=runner.read_bytes())
     _wire_session(flow, session, adapter)
+    from repair_tool.arch.mips32 import ElfAnalysis
     with ElfAnalysis(flow.session_dir / "rootfs" / "sbin" / "httpd") as analysis:
         site = analysis.call_sites(("concat_impl",))[0]["vaddr"]
 
@@ -775,6 +1031,1194 @@ def test_localize_registers_model_selected_site_and_keeps_history(
     assert flow.ledger_for_target().get("e2")["kind"] == "model_code_site"
     queries = flow.ledger_for_target().by_kind("model_query")
     assert [item["status"] for item in queries] == ["answered", "answered"]
+
+
+def test_localize_accepts_command_injection_marker_fault(
+        fake_session, tmp_path, monkeypatch):
+    """A confirmed command-injection marker has no crash signal and must
+    still provide the model enough evidence to register a patch site."""
+    from repair_tool.arch.mips32 import ElfAnalysis
+
+    # The synthetic fixture uses concat_impl as its redirectable call; this
+    # legacy test checks that a non-crash marker fault can be localized, not
+    # command-sink ranking.
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_command_marker_sink_eligibility",
+        classmethod(lambda cls, _entry: None))
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_marker_site_evidence_eligibility",
+        lambda _self, _entry, _fault, _session, _reproduction, _plan: {
+            "decision": "accepted",
+            "semantic_class": "marker_chain_not_evaluatable",
+        })
+    session, adapter = fake_session
+    rootfs = tmp_path / "rootfs" / "marker-localize"
+    rootfs.mkdir(parents=True)
+    runner = build_runner(rootfs)
+    (rootfs / "sbin").mkdir()
+    (rootfs / "sbin" / "httpd").write_bytes(runner.read_bytes())
+    poc = tmp_path / "marker-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, rootfs, poc,
+                         analysis_target=runner.read_bytes())
+    _wire_session(flow, session, adapter)
+    from repair_tool.arch.mips32 import ElfAnalysis
+    with ElfAnalysis(flow.session_dir / "rootfs" / "sbin" / "httpd") as analysis:
+        site = analysis.call_sites(("concat_impl",))[0]["vaddr"]
+
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "request": {"method": "POST", "path": "/ping.ccp",
+                    "form": {"act": "ping_v4"}},
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+        "outcome": "command_injection_marker",
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+    })
+    flow.model.script(
+        "localize",
+        {"query": {"op": "elf_info"}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        {"evidence": ["e2"], "reasoning": "selected the command path"},
+    )
+
+    flow.localize()
+
+    calls = [call for call in flow.model.calls if call["stage"] == "localize"]
+    initial_fault = calls[0]["payload"]["fault"]
+    conclusion_fault = calls[-1]["payload"]["fault"]
+    for fault in (initial_fault, conclusion_fault):
+        assert fault["outcome"] == "command_injection_marker"
+        assert fault["marker"] == {
+            "guest_path": "/Q", "created": True, "empty": True}
+        assert "signal" not in fault
+    result = json.loads(
+        (flow.root / "localize" / "result.json").read_text(encoding="utf-8"))
+    assert result["evidence"] == ["e2"]
+    assert result["selected_sites"][0]["semantic_eligibility"] == {
+        "decision": "accepted", "semantic_class": "not_memory_fault",
+        "marker_evidence_chain": {
+            "decision": "accepted",
+            "semantic_class": "marker_chain_not_evaluatable",
+        }}
+
+
+def test_marker_handler_coverage_requires_nearby_data_table_handlers():
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    left_handler = 0x41322C
+    right_handler = 0x412F0C
+    answers = [
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"},
+         "answer": {"matches": [{"address": string_address}]}},
+        {"query": {"op": "data_references", "address": string_address},
+         "answer": {"references": [
+             {"kind": "word", "vaddr": table_address}]}},
+        {"query": {"op": "data_table_context", "address": table_address},
+         "answer": {"words": [
+             {"vaddr": table_address - 4, "value": left_handler,
+              "classification": "executable_pointer"},
+             {"vaddr": table_address, "value": string_address,
+              "classification": "ascii_pointer"},
+             {"vaddr": table_address + 4, "value": right_handler,
+              "classification": "executable_pointer"},
+         ]}},
+        {"query": {"op": "function_calls", "address": left_handler,
+                   "contains": "system"},
+         "answer": {"calls": [{"vaddr": 0x413540, "callee": "system"}]}},
+        # A filtered empty page is not coverage: the model may have selected
+        # the wrong callee token.
+        {"query": {"op": "function_calls", "address": right_handler,
+                   "contains": "execve"},
+         "answer": {"calls": []}},
+    ]
+    reproduction = {
+        "confirmed_ids": ["trigger"],
+        "detail": [{"id": "trigger", "request": {
+            "method": "POST", "path": "/apc_client_pin.cgi",
+            "form": {"wps_pin": "12345670"}}}],
+    }
+    fault = {"outcome": "command_injection_marker"}
+
+    partial = FirmwareWorkflow._marker_handler_coverage(
+        fault, reproduction, None, answers,
+        fallback_request={"method": "POST", "path": "/apc_client_pin.cgi",
+                          "form": {"wps_pin": "12345670"}})
+
+    assert partial["active"] is True
+    assert partial["uncovered_addresses"] == [right_handler]
+    by_address = {item["address"]: item for item in partial["handlers"]}
+    assert by_address[left_handler]["covered"] is True
+    assert by_address[right_handler]["covered"] is False
+    assert by_address[right_handler]["sources"][0]["request_string"] == \
+        "apc_client_pin.cgi"
+    assert FirmwareWorkflow._marker_handler_gate(
+        {"op": "disassemble", "address": 0x413540}, partial) is not None
+    assert FirmwareWorkflow._marker_handler_gate(
+        {"op": "register_patch_site", "address": 0x413540},
+        partial) is not None
+    assert FirmwareWorkflow._marker_handler_gate(
+        {"op": "function_calls", "address": right_handler,
+         "contains": "system"}, partial) is None
+
+    covered = FirmwareWorkflow._marker_handler_coverage(
+        fault, reproduction, None,
+        [*answers, {
+            "query": {"op": "function_calls", "address": right_handler},
+            "answer": {"calls": []},
+        }],
+        fallback_request={"method": "POST", "path": "/apc_client_pin.cgi",
+                          "form": {"wps_pin": "12345670"}})
+    assert covered["uncovered_addresses"] == []
+    assert FirmwareWorkflow._marker_handler_gate(
+        {"op": "disassemble", "address": 0x4131EC}, covered) is None
+
+
+def test_marker_handler_coverage_falls_back_to_confirmed_fault_request():
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    handler = 0x412F0C
+    answers = [
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"},
+         "answer": {"matches": [{"address": string_address}]}},
+        {"query": {"op": "data_references", "address": string_address},
+         "answer": {"references": [
+             {"kind": "word", "vaddr": table_address}]}},
+        {"query": {"op": "data_table_context", "address": table_address},
+         "answer": {"words": [
+             {"vaddr": table_address, "value": string_address,
+              "classification": "ascii_pointer"},
+             {"vaddr": table_address + 4, "value": handler,
+              "classification": "executable_pointer"},
+         ]}},
+    ]
+    fault = {
+        "outcome": "command_injection_marker",
+        "marker": {"created": True, "empty": True},
+        "request": {"method": "POST", "path": "/apc_client_pin.cgi",
+                    "form": {"wps_pin": "';>/Q ;#"}},
+    }
+
+    result = FirmwareWorkflow._marker_handler_coverage(
+        fault, None, None, answers,
+        fallback_request={"method": "POST", "path": "/apc_client_pin.cgi",
+                          "form": {"wps_pin": "';>/Q ;#"}})
+
+    assert result["active"] is True
+    assert result["uncovered_addresses"] == [handler]
+
+
+def test_registration_recovery_allows_exact_disassembly_after_deferral(
+        fake_session, tmp_path, monkeypatch):
+    """A deferred nomination must not lock the model into registration-only."""
+    import repair_tool.firmware.loop as loop_module
+    from repair_tool.arch.mips32 import ElfAnalysis
+    from repair_tool.firmware.query import EvidenceSession as RealSession
+
+    session, adapter = fake_session
+    rootfs = tmp_path / "rootfs" / "registration-recovery"
+    rootfs.mkdir(parents=True)
+    runner = build_runner(rootfs)
+    (rootfs / "sbin").mkdir()
+    (rootfs / "sbin" / "httpd").write_bytes(runner.read_bytes())
+    poc = tmp_path / "registration-recovery-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, rootfs, poc,
+                         analysis_target=runner.read_bytes())
+    _wire_session(flow, session, adapter)
+    with ElfAnalysis(flow.session_dir / "rootfs" / "sbin" / "httpd") as analysis:
+        site = analysis.call_sites(("concat_impl",))[0]["vaddr"]
+
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    handler_address = site - 0x10
+
+    class RecoverySession(RealSession):
+        def _ascii_search(self, query):
+            answer = ({"matches": [{"address": string_address}]}
+                      if query.get("text") == "apc_client_pin.cgi"
+                      else {"matches": []})
+            self._log(query, answer)
+            return answer
+
+        def _data_references(self, query):
+            answer = ({"references": [
+                {"kind": "word", "vaddr": table_address}]}
+                      if query.get("address") == string_address
+                      else {"references": []})
+            self._log(query, answer)
+            return answer
+
+        def _data_table_context(self, query):
+            answer = ({"words": [
+                {"vaddr": table_address, "value": string_address,
+                 "classification": "ascii_pointer"},
+                {"vaddr": table_address + 4, "value": handler_address,
+                 "classification": "executable_pointer",
+                 "function": {"start": handler_address,
+                              "end": handler_address + 0x1000}},
+            ]} if query.get("address") == table_address else {"words": []})
+            self._log(query, answer)
+            return answer
+
+        def _function_calls(self, query):
+            function = {"start": handler_address,
+                        "end": handler_address + 0x1000}
+            answer = {"calls": []}
+            if query.get("address") == handler_address:
+                answer = {"calls": [{
+                    "vaddr": site, "callee": "system",
+                    "redirectable": True,
+                    "bytes_hex": "41" * 16,
+                    "got_vaddr": 0x10000000,
+                    "got_value": 0x400000,
+                    "delay_slot_hex": "00000000",
+                }]}
+            answer["function"] = function
+            self._log(query, answer)
+            return answer
+
+        def _disassemble(self, query):
+            if query.get("address") == site or query.get("site") == site:
+                answer = {"window": {"start": site, "end": site + 4,
+                                     "instructions": [{"vaddr": site}]}}
+                self._log(query, answer)
+                return answer
+            raise RepairError("model_output_invalid", "unexpected disassembly")
+
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_command_marker_sink_eligibility",
+        classmethod(lambda cls, _entry: None))
+    monkeypatch.setattr(loop_module, "EvidenceSession", RecoverySession)
+    flow.reproduction = None
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker",
+        "request": {"method": "POST", "path": "/apc_client_pin.cgi",
+                    "form": {"wps_pin": "';>/Q ;#"}},
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+    conclusion = {"evidence": ["__REGISTRATION__"],
+                  "reasoning": "recovered the deferred exact site"}
+
+    class RecoveryModel(ScriptedModel):
+        def ask(self, stage, payload, directory, **_):
+            reply = super().ask(stage, payload, directory)
+            if reply == conclusion:
+                registration = payload.get("registered_patch_sites") or [{}]
+                reply["evidence"] = [registration[0]["evidence"]]
+            return reply
+
+    flow.model = RecoveryModel(flow.cfg, flow.root)
+    flow.model.script(
+        "localize",
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"}},
+        {"query": {"op": "data_references", "address": string_address}},
+        {"query": {"op": "data_table_context", "address": table_address}},
+        {"query": {"op": "function_calls", "address": handler_address,
+                   "contains": "system"}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        {"query": {"op": "elf_info"}},
+        {"query": {"op": "disassemble", "address": site, "around": 8}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        conclusion,
+    )
+
+    flow.localize()
+
+    calls = [call for call in flow.model.calls if call["stage"] == "localize"]
+    deferred_payload = next(
+        call["payload"] for call in calls
+        if call["payload"].get("query_error", {}).get(
+            "error") == "Patch-site nomination needs more evidence before "
+                        "it can be accepted")
+    assert deferred_payload["query_error"]["rule"].startswith(
+        "Run only the decisive read-only")
+    deferred_index = next(
+        index for index, call in enumerate(calls)
+        if call["payload"] is deferred_payload)
+    post_deferral = calls[deferred_index + 1]["payload"]
+    assert "registration_decision_required" not in post_deferral
+    rejected = next(call["payload"] for call in calls
+                    if call["payload"].get("query_error", {}).get(
+                        "stage_category") == "registration_recovery_required")
+    assert rejected["query_error"]["budget_charged"] is False
+    assert "allowed" in rejected["query_error"]
+    assert flow.localized is not None
+
+
+def test_runtime_probe_candidates_use_only_visible_command_calls(tmp_path):
+    from repair_tool.firmware.evidence import EvidenceLedger
+
+    target = tmp_path / "probe-target"
+    target.write_bytes(b"baseline")
+    ledger = EvidenceLedger(tmp_path / "probe-ledger",
+                            target)
+    visible = [
+        0x4131EC, 0x413540, 0x41368C, 0x413884, 0x413B90,
+    ]
+    for site in visible:
+        ledger.add("model_query", {
+            "target_kind": "baseline",
+            "query": {"op": "function_calls", "address": 0x412F0C,
+                      "contains": "system"},
+            "answer": {"calls": [{
+                "vaddr": site, "callee": "_system",
+                "bytes_hex": f"{site:08x}", "redirectable": True,
+            }]},
+        })
+    ledger.add("model_query", {
+        "target_kind": "baseline",
+        "query": {"op": "function_calls", "address": 0x41A048},
+        "answer": {"calls": [{
+            "vaddr": 0x41A0B0, "callee": "nvram_safe_get",
+            "bytes_hex": "41a0b0", "redirectable": True,
+        }]},
+    })
+    ledger.add("model_query", {
+        "target_kind": "baseline",
+        "query": {"op": "function_calls", "address": 0x412F0C},
+        "answer": {"calls": [{
+            "vaddr": 0x41322C, "callee": "system",
+            "bytes_hex": "41322c", "redirectable": False,
+        }]},
+    })
+
+    candidates = FirmwareWorkflow._runtime_probe_candidate_sinks(
+        ledger,
+        {"failed_wrapper_sites": [
+            {"site": 0x413540, "mode": "wrapper"},
+            {"site": 0x41368C, "mode": "wrapper"},
+        ]},
+        {"outcome": "command_injection_marker"})
+
+    assert [item["site"] for item in candidates] == [
+        0x4131EC, 0x413884, 0x413B90]
+    assert all(item["source_evidence"].startswith("e") for item in candidates)
+
+
+def test_runtime_probe_candidates_exclude_sinks_not_blocked_by_probe(tmp_path):
+    from repair_tool.firmware.evidence import EvidenceLedger
+
+    target = tmp_path / "probe-target"
+    target.write_bytes(b"baseline")
+    ledger = EvidenceLedger(tmp_path / "probe-ledger", target)
+    for site in (0x4131EC, 0x413540):
+        ledger.add("model_query", {
+            "target_kind": "baseline",
+            "query": {"op": "function_calls", "address": 0x412F0C,
+                      "contains": "system"},
+            "answer": {"calls": [{
+                "vaddr": site, "callee": "_system",
+                "bytes_hex": f"{site:08x}", "redirectable": True,
+            }]},
+        })
+    ledger.add("runtime_sink_probe", {
+        "site": 0x413540,
+        "marker_present": True,
+        "marker_blocked": False,
+        "status": "completed",
+    })
+
+    candidates = FirmwareWorkflow._runtime_probe_candidate_sinks(
+        ledger, {}, {"outcome": "command_injection_marker"})
+
+    assert [item["site"] for item in candidates] == [0x4131EC]
+
+
+def test_runtime_sink_probe_deploys_fixed_wrapper_and_rolls_back(
+        fake_session, tmp_path, monkeypatch):
+    session, adapter = fake_session
+    rootfs = tmp_path / "rootfs" / "sink-probe"
+    poc = tmp_path / "sink-probe-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    flow.plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/",
+             "capture_fields": ["graph_id"]},
+            {"id": "login", "method": "POST", "path": "/login.cgi",
+             "form": {"graph_id": {"capture": "graph_id"}}},
+            {"id": "control", "method": "POST", "path": "/valid.cgi",
+             "expect": "marker_created"},
+            {"id": "trigger", "method": "POST", "path": "/apc_client_pin.cgi",
+             "expect": "marker_created"},
+        ],
+    }
+    flow.reproduction = {"confirmed_ids": ["trigger"]}
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker", "protocol": flow.plan["protocol"],
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+    marker_file = flow.session_dir / "rootfs" / "Q"
+    candidate = tmp_path / "probe-candidate"
+    candidate.write_bytes(b"probe-candidate")
+    built = {"candidate": candidate, "record": {
+        "candidate_sha256": _sha_bytes(candidate.read_bytes())}}
+
+    def fake_build(_target, edits, out_dir, **_kwargs):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return built
+
+    def fake_execute(_control, steps, **_kwargs):
+        assert [item["id"] for item in steps] == [
+            "home", "login", "control", "trigger"]
+        marker_file.write_bytes(b"")
+        return {
+            "passed": True,
+            "stable_identity": True,
+            "results": [
+                {"id": "home", "expect": "response", "status": "ok"},
+                {"id": "login", "expect": "response", "status": "ok"},
+                {"id": "control", "expect": "marker_absent", "status": "ok"},
+                {"id": "trigger", "expect": "marker_created", "status": "ok",
+                 "marker_after": {"exists": False, "guest_path": "/Q"}},
+            ],
+        }
+
+    monkeypatch.setattr("repair_tool.firmware.loop.build_candidate",
+                        fake_build)
+    monkeypatch.setattr(
+        "repair_tool.firmware.loop.execute_steps", fake_execute)
+    candidate_record = {
+        "site": 0x4131EC, "site_hex": "0x004131ec",
+        "callee": "_system", "bytes_hex": "41" * 16,
+        "source_evidence": "e1",
+    }
+
+    results = flow._runtime_sink_probe(
+        {"failed_wrapper_sites": []}, [candidate_record],
+        flow.root / "runtime-sink-probes" / "001")
+
+    assert len(results) == 1
+    assert results[0]["status"] == "completed"
+    assert results[0]["marker_blocked"] is True
+    assert results[0]["stable_identity"] is True
+    assert results[0]["rollback_status"] == "baseline_restored"
+    assert flow.ledger_for_target().by_kind("runtime_sink_probe")
+    assert adapter.target_file.read_bytes() == flow.baseline_bytes.read_bytes()
+    assert (flow.root / "runtime-sink-probes" / "001" /
+            "004131ec" / "record.json").is_file()
+
+
+def test_runtime_sink_probe_scenario_keeps_authenticated_prefix(
+        fake_session, tmp_path):
+    session, adapter = fake_session
+    poc = tmp_path / "sink-probe-prefix-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    flow.plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker", "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/"},
+            {"id": "login", "method": "POST", "path": "/login.cgi"},
+            {"id": "trigger", "method": "POST", "path": "/x.cgi",
+             "expect": "marker_created"},
+            {"id": "post_control", "method": "POST", "path": "/valid.cgi"},
+        ],
+    }
+    flow.reproduction = {"confirmed_ids": ["trigger"]}
+
+    assert [item["id"] for item in flow._runtime_sink_probe_scenario()] == [
+        "home", "login", "trigger"]
+
+
+def test_runtime_sink_probe_transport_failure_is_inconclusive():
+    observation = FirmwareWorkflow._runtime_sink_probe_observation(None, {
+        "passed": False,
+        "stable_identity": True,
+        "results": [{
+            "id": "login", "expect": "response", "status": "failed",
+            "reason": "incomplete_response",
+        }, {
+            "id": "trigger", "expect": "marker_created", "status": "failed",
+            "reason": "incomplete_response",
+        }],
+    })
+
+    assert observation["status"] == "inconclusive"
+    assert observation["marker_blocked"] is None
+    assert observation["marker_present"] is None
+    assert observation["failure_kind"] == "transport_or_session_failure"
+
+
+def test_runtime_sink_probe_stops_after_invalid_scenario(
+        fake_session, tmp_path, monkeypatch):
+    session, adapter = fake_session
+    poc = tmp_path / "sink-probe-invalid-scenario-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    flow.plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker", "marker": "/Q",
+        "requests": [
+            {"id": "login", "method": "POST", "path": "/login.cgi"},
+            {"id": "trigger", "method": "POST", "path": "/x.cgi",
+             "expect": "marker_created"},
+        ],
+    }
+    flow.reproduction = {"confirmed_ids": ["trigger"]}
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker", "protocol": flow.plan["protocol"],
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+    candidate = tmp_path / "invalid-scenario-candidate"
+    candidate.write_bytes(b"candidate")
+    built = {"candidate": candidate, "record": {
+        "candidate_sha256": _sha_bytes(candidate.read_bytes())}}
+    monkeypatch.setattr(
+        "repair_tool.firmware.loop.build_candidate",
+        lambda _target, _edits, out_dir, **_kwargs: (
+            out_dir.mkdir(parents=True, exist_ok=True), built)[1])
+    monkeypatch.setattr(
+        "repair_tool.firmware.loop.execute_steps",
+        lambda *_args, **_kwargs: {
+            "passed": False, "stable_identity": True,
+            "results": [
+                {"id": "login", "expect": "response", "status": "failed",
+                 "reason": "incomplete_response"},
+                {"id": "trigger", "expect": "marker_created", "status": "failed",
+                 "reason": "incomplete_response"},
+            ],
+        })
+    records = [{
+        "site": site, "site_hex": f"0x{site:08x}", "callee": "_system",
+        "bytes_hex": "41" * 16, "source_evidence": "e1",
+    } for site in (0x4131EC, 0x413540)]
+
+    results = flow._runtime_sink_probe(
+        {}, records, flow.root / "runtime-sink-probes" / "001")
+
+    assert len(results) == 1
+    assert results[0]["status"] == "inconclusive"
+    assert results[0]["marker_blocked"] is None
+    assert results[0]["failure_kind"] == "transport_or_session_failure"
+    assert flow.report["warnings"][-1]["reason"] == "transport_or_session_failure"
+    assert adapter.target_file.read_bytes() == flow.baseline_bytes.read_bytes()
+
+
+def test_runtime_sink_probe_rollback_failure_is_not_masked(
+        fake_session, tmp_path, monkeypatch):
+    session, adapter = fake_session
+    poc = tmp_path / "sink-probe-rollback-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    flow.plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker", "marker": "/Q",
+        "requests": [{"id": "trigger", "method": "POST", "path": "/x.cgi",
+                      "expect": "marker_created"}],
+    }
+    flow.reproduction = {"confirmed_ids": ["trigger"]}
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker", "protocol": flow.plan["protocol"],
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+    candidate = tmp_path / "rollback-probe-candidate"
+    candidate.write_bytes(b"rollback-probe-candidate")
+    built = {"candidate": candidate, "record": {
+        "candidate_sha256": _sha_bytes(candidate.read_bytes())}}
+
+    def fake_build(_target, _edits, out_dir, **_kwargs):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return built
+
+    monkeypatch.setattr("repair_tool.firmware.loop.build_candidate",
+                        fake_build)
+    monkeypatch.setattr("repair_tool.firmware.loop.restore",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            RepairError("rollback_failed", "restore failed")))
+    record = {"site": 0x4131EC, "site_hex": "0x004131ec",
+              "callee": "_system", "bytes_hex": "41" * 16,
+              "source_evidence": "e1"}
+
+    with pytest.raises(RepairError, match="rollback failed"):
+        flow._runtime_sink_probe({}, [record],
+                                flow.root / "runtime-sink-probes" / "001")
+
+    persisted = json.loads(
+        (flow.root / "runtime-sink-probes" / "001" / "004131ec" /
+         "record.json").read_text(encoding="utf-8"))
+    assert persisted["rollback_status"] == "rollback_failed"
+    assert flow.report["warnings"][-1]["stage"] == "runtime-sink-probe"
+
+
+def test_runtime_sink_probe_requires_confirmed_marker_scenario(
+        fake_session, tmp_path):
+    session, adapter = fake_session
+    poc = tmp_path / "sink-probe-scenario-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker", "protocol": "legacy",
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+
+    assert flow._runtime_sink_probe_scenario() is None
+    assert flow._runtime_sink_probe({}, [{
+        "site": 0x4131EC, "site_hex": "0x004131ec", "callee": "_system",
+        "bytes_hex": "41" * 16, "source_evidence": "e1",
+    }], flow.root / "runtime-sink-probes" / "001") == []
+
+
+def test_runtime_sink_probe_prompt_includes_initial_localization_results(
+        fake_session, tmp_path, monkeypatch):
+    """Initial marker localization can consume bounded runtime probes after evidence."""
+    from repair_tool.arch.mips32 import ElfAnalysis
+    session, adapter = fake_session
+    rootfs = tmp_path / "rootfs" / "initial-runtime-probe-prompt"
+    poc = tmp_path / "initial-runtime-probe-prompt.py"
+    poc.write_text(POC_SOURCE)
+    rootfs.mkdir(parents=True, exist_ok=True)
+    runner = build_runner(rootfs)
+    (rootfs / "sbin").mkdir(parents=True, exist_ok=True)
+    (rootfs / "sbin" / "httpd").write_bytes(runner.read_bytes())
+    flow = make_workflow(tmp_path, rootfs, poc,
+                         analysis_target=runner.read_bytes())
+    _wire_session(flow, session, adapter)
+    with ElfAnalysis(flow.session_dir / "rootfs" / "sbin" / "httpd") as analysis:
+        handler_address = analysis.containing_function(
+            analysis.call_sites(("concat_impl",))[0]["vaddr"])["start"]
+    string_address = 0x457E84
+    table_address = 0x100007C8
+
+    def candidate_sinks(ledger, _feedback, _fault):
+        visible = [
+            item for item in ledger.by_kind("model_query")
+            if item.get("query", {}).get("op") == "function_calls"
+            and isinstance(item.get("answer", {}).get("calls"), list)
+            and item["answer"]["calls"]
+        ]
+        if not visible:
+            return []
+        return [
+            {"site": 0x4131EC, "site_hex": "0x004131ec",
+             "callee": "_system", "bytes_hex": "41" * 16,
+             "source_evidence": visible[-1]["id"]},
+            {"site": 0x413540, "site_hex": "0x00413540",
+             "callee": "system", "bytes_hex": "42" * 16,
+             "source_evidence": visible[-1]["id"]},
+        ]
+
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_runtime_probe_candidate_sinks",
+        staticmethod(candidate_sinks))
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_command_marker_sink_eligibility",
+        classmethod(lambda _cls, _entry: None))
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_marker_handler_coverage",
+        classmethod(lambda *_args, **_kwargs: {
+            "active": True, "handlers": [], "uncovered_addresses": [],
+        }))
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_runtime_sink_probe",
+        lambda _self, _feedback, _candidates, directory: [{
+            "site": 0x4131EC, "site_hex": "0x004131ec",
+            "callee": "_system", "source_evidence": "e1",
+            "status": "completed", "marker_blocked": True,
+            "marker_present": False, "stable_identity": True,
+            "failure_kind": "marker_blocked", "failed_steps": [],
+            "evidence": "e2",
+        }])
+    flow.plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker", "marker": "/Q",
+        "requests": [{"id": "trigger", "method": "POST", "path": "/x.cgi",
+                      "expect": "marker_created"}],
+    }
+    flow.reproduction = {"confirmed_ids": ["trigger"]}
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker",
+        "protocol": flow.plan["protocol"],
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+
+    calls: list[dict] = []
+
+    class ProbeModel:
+        def __init__(self, cfg, root):
+            self.cfg, self.root = cfg, root
+            self.calls = []
+
+        def ask(self, stage, payload, directory, **_):
+            calls.append(payload)
+            if payload.get("runtime_sink_probes"):
+                raise RepairError("localization_failed", "stop after capture")
+            if len(calls) == 1:
+                return {"query": {"op": "function_calls",
+                                  "address": handler_address,
+                                  "contains": "concat"}}
+            return {"query": {"op": "elf_info"}}
+
+    flow.model = ProbeModel(flow.cfg, flow.root)
+
+    with pytest.raises(RepairError, match="stop after capture"):
+        flow.localize()
+
+    probe_payload = next(call for call in calls
+                         if call.get("runtime_sink_probes"))
+    assert probe_payload["runtime_sink_probes"][0]["marker_blocked"] is True
+    assert probe_payload["runtime_sink_probes"][0]["failure_kind"] == "marker_blocked"
+    assert probe_payload["runtime_sink_probes"][0]["failed_steps"] == []
+    assert probe_payload["query_answer"]["calls"][0]["callee"] == "concat_impl"
+
+
+def test_localization_marker_gate_rejects_bypass_without_charging_budget(
+        fake_session, tmp_path, monkeypatch):
+    """The controller must make nearby-handler coverage mandatory."""
+    import repair_tool.firmware.loop as loop_module
+    from repair_tool.arch.mips32 import ElfAnalysis
+    from repair_tool.firmware.query import EvidenceSession as RealSession
+
+    # This test exercises handler coverage, not command-sink ranking.  Its
+    # synthetic MIPS fixture naturally calls concat_impl rather than system.
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_command_marker_sink_eligibility",
+        classmethod(lambda cls, _entry: None))
+
+    session, adapter = fake_session
+    rootfs = tmp_path / "rootfs" / "marker-gate"
+    rootfs.mkdir(parents=True)
+    runner = build_runner(rootfs)
+    (rootfs / "sbin").mkdir()
+    (rootfs / "sbin" / "httpd").write_bytes(runner.read_bytes())
+    poc = tmp_path / "marker-gate-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, rootfs, poc,
+                         analysis_target=runner.read_bytes())
+    _wire_session(flow, session, adapter)
+    with ElfAnalysis(flow.session_dir / "rootfs" / "sbin" / "httpd") as analysis:
+        site = analysis.call_sites(("concat_impl",))[0]["vaddr"]
+
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    left_handler = 0x41322C
+    right_handler = 0x412F0C
+
+    class GateSession(RealSession):
+        def _ascii_search(self, query):
+            if query.get("text") == "apc_client_pin.cgi":
+                answer = {"matches": [{"address": string_address}]}
+            else:
+                answer = {"matches": []}
+            self._log(query, answer)
+            return answer
+
+        def _data_references(self, query):
+            if query.get("address") == string_address:
+                answer = {"references": [
+                    {"kind": "word", "vaddr": table_address}]}
+            else:
+                answer = {"references": []}
+            self._log(query, answer)
+            return answer
+
+        def _data_table_context(self, query):
+            if query.get("address") == table_address:
+                answer = {"words": [
+                    {"vaddr": table_address - 4, "value": left_handler,
+                     "classification": "executable_pointer",
+                     "function": {"start": left_handler,
+                                  "end": left_handler + 0x1000}},
+                    {"vaddr": table_address, "value": string_address,
+                     "classification": "ascii_pointer"},
+                    {"vaddr": table_address + 4, "value": right_handler,
+                     "classification": "executable_pointer",
+                     "function": {"start": site,
+                                  "end": right_handler + 0x1000}},
+                ]}
+            else:
+                answer = {"words": []}
+            self._log(query, answer)
+            return answer
+
+        def _function_calls(self, query):
+            if query.get("address") == right_handler and query.get(
+                    "contains") == "system":
+                answer = {"calls": [{"vaddr": site, "callee": "system"}]}
+            else:
+                answer = {"calls": []}
+            self._log(query, answer)
+            return answer
+
+        def _disassemble(self, query):
+            if query.get("address") == site or query.get("site") == site:
+                answer = {"window": {
+                    "start": site, "end": site + 4,
+                    "instructions": [{"vaddr": site}],
+                }}
+                self._log(query, answer)
+                return answer
+            raise RepairError("model_output_invalid", "unexpected disassembly")
+
+    monkeypatch.setattr(loop_module, "EvidenceSession", GateSession)
+    flow.reproduction = {
+        "confirmed_ids": ["trigger"],
+        "detail": [{"id": "trigger", "request": {
+            "method": "POST", "path": "/apc_client_pin.cgi",
+            "form": {"wps_pin": "12345670"}}}],
+    }
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker",
+        "request": {"method": "POST", "path": "/apc_client_pin.cgi"},
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+
+    conclusion = {"evidence": ["__REGISTRATION__"],
+                  "reasoning": "covered both nearby handlers"}
+
+    class CoverageModel(ScriptedModel):
+        def ask(self, stage, payload, directory, **_):
+            reply = super().ask(stage, payload, directory)
+            if reply == conclusion:
+                registration = payload.get("registered_patch_sites") or [{}]
+                reply["evidence"] = [registration[0]["evidence"]]
+            return reply
+
+    flow.model = CoverageModel(flow.cfg, flow.root)
+    flow.model.script(
+        "localize",
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"}},
+        {"query": {"op": "data_references", "address": string_address}},
+        {"query": {"op": "data_table_context", "address": table_address}},
+        {"query": {"op": "disassemble", "address": left_handler}},
+        {"query": {"op": "function_calls", "address": left_handler,
+                   "contains": "system"}},
+        {"query": {"op": "function_calls", "address": left_handler}},
+        {"query": {"op": "function_calls", "address": right_handler,
+                   "contains": "system"}},
+        {"query": {"op": "disassemble", "address": site, "around": 8}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        conclusion,
+    )
+
+    flow.localize()
+
+    calls = [call for call in flow.model.calls
+             if call["stage"] == "localize"]
+    assert len(calls) == 10
+    rejected_payload = calls[4]["payload"]
+    assert rejected_payload["query_error"][
+        "stage_category"] == "marker_handler_coverage_required"
+    assert rejected_payload["localization_budget"]["queries_used"] == 3
+    assert rejected_payload["marker_handler_coverage"][
+        "uncovered_addresses"] == [right_handler, left_handler]
+    assert calls[7]["payload"]["localization_budget"]["queries_used"] == 6
+    trace = [
+        json.loads(line) for line in
+        (flow.root / "evidence" / "query-trace.jsonl").read_text().splitlines()
+    ]
+    assert [(item["status"], item["query"].get("op")) for item in trace] == [
+        ("answered", "ascii_search"),
+        ("answered", "data_references"),
+        ("answered", "data_table_context"),
+        ("rejected", "disassemble"),
+        ("answered", "function_calls"),
+        ("answered", "function_calls"),
+        ("answered", "function_calls"),
+        ("answered", "disassemble"),
+        ("answered", "register_patch_site"),
+    ]
+    assert flow.localized is not None
+
+
+def test_duplicate_deferred_nomination_does_not_burn_query_budget(
+        fake_session, tmp_path, monkeypatch):
+    import repair_tool.firmware.loop as loop_module
+    from repair_tool.arch.mips32 import ElfAnalysis
+    from repair_tool.firmware.query import EvidenceSession as RealSession
+
+    session, adapter = fake_session
+    rootfs = tmp_path / "rootfs" / "deferred-nomination"
+    rootfs.mkdir(parents=True)
+    runner = build_runner(rootfs)
+    (rootfs / "sbin").mkdir()
+    (rootfs / "sbin" / "httpd").write_bytes(runner.read_bytes())
+    poc = tmp_path / "deferred-nomination-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, rootfs, poc,
+                         analysis_target=runner.read_bytes())
+    _wire_session(flow, session, adapter)
+    with ElfAnalysis(flow.session_dir / "rootfs" / "sbin" / "httpd") as analysis:
+        site = analysis.call_sites(("concat_impl",))[0]["vaddr"]
+
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    handler_address = site
+    function = {"start": site - 0x100, "end": site + 0x100}
+
+    class DeferredSession(RealSession):
+        registrations = []
+
+        def _log(self, query, answer):
+            super()._log(query, answer)
+            if answer.get("op") == "register_patch_site":
+                DeferredSession.registrations.append(answer)
+
+        def _ascii_search(self, query):
+            answer = ({"matches": [{"address": string_address}]}
+                      if query.get("text") == "apc_client_pin.cgi"
+                      else {"matches": []})
+            self._log(query, answer)
+            return answer
+
+        def _data_references(self, query):
+            answer = ({"references": [
+                {"kind": "word", "vaddr": table_address}]}
+                if query.get("address") == string_address
+                else {"references": []})
+            self._log(query, answer)
+            return answer
+
+        def _data_table_context(self, query):
+            answer = ({"words": [
+                {"vaddr": table_address, "value": string_address,
+                 "classification": "ascii_pointer"},
+                {"vaddr": table_address + 4, "value": handler_address,
+                 "classification": "executable_pointer",
+                 "function": function},
+            ]} if query.get("address") == table_address else {"words": []})
+            self._log(query, answer)
+            return answer
+
+        def _function_calls(self, query):
+            answer = ({"calls": [{"vaddr": site, "callee": "system"}]}
+                      if query.get("address") == handler_address
+                      and not query.get("contains")
+                      else {"calls": []})
+            self._log(query, answer)
+            return answer
+
+        def _disassemble(self, query):
+            if query.get("address") == site or query.get("site") == site:
+                answer = {"window": {
+                    "start": site, "end": site + 4,
+                    "instructions": [{"vaddr": site}],
+                }}
+                self._log(query, answer)
+                return answer
+            raise RepairError("model_output_invalid", "unexpected disassembly")
+
+    monkeypatch.setattr(
+        FirmwareWorkflow, "_command_marker_sink_eligibility",
+        classmethod(lambda cls, _entry: None))
+    monkeypatch.setattr(loop_module, "EvidenceSession", DeferredSession)
+    flow.reproduction = {
+        "confirmed_ids": ["trigger"],
+        "detail": [{"id": "trigger", "request": {
+            "method": "POST", "path": "/apc_client_pin.cgi",
+            "form": {"wps_pin": "12345670"}}}],
+    }
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "outcome": "command_injection_marker",
+        "request": {"method": "POST", "path": "/apc_client_pin.cgi"},
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+    })
+    conclusion = {"evidence": ["__REGISTRATION__"],
+                  "reasoning": "completed exact-site evidence"}
+
+    class DeferredModel(ScriptedModel):
+        def ask(self, stage, payload, directory, **_):
+            reply = super().ask(stage, payload, directory)
+            if reply == conclusion:
+                reply["evidence"] = [DeferredSession.registrations[-1]["evidence"]]
+            return reply
+
+    flow.model = DeferredModel(flow.cfg, flow.root)
+    flow.model.script(
+        "localize",
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"}},
+        {"query": {"op": "data_references", "address": string_address}},
+        {"query": {"op": "data_table_context", "address": table_address}},
+        {"query": {"op": "function_calls", "address": handler_address}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        {"query": {"op": "disassemble", "address": site, "around": 8}},
+        {"query": {"op": "register_patch_site", "address": site}},
+        conclusion,
+    )
+
+    flow.localize()
+
+    calls = [call for call in flow.model.calls
+             if call["stage"] == "localize"]
+    duplicate_payload = next(
+        call["payload"] for call in calls
+        if "already deferred" in json.dumps(call["payload"]))
+    duplicate_error = (
+        duplicate_payload.get("query_error")
+        or duplicate_payload.get("registration_error"))
+    assert duplicate_error["budget_charged"] is False
+    assert duplicate_payload["localization_budget"]["queries_used"] == 5
+    trace = [json.loads(line) for line in
+             (flow.root / "evidence" / "query-trace.jsonl")
+             .read_text(encoding="utf-8").splitlines()]
+    assert [(item["status"], item["query"].get("op")) for item in trace] == [
+        ("answered", "ascii_search"),
+        ("answered", "data_references"),
+        ("answered", "data_table_context"),
+        ("answered", "function_calls"),
+        ("answered", "register_patch_site"),
+        ("rejected", "register_patch_site"),
+        ("rejected", "register_patch_site"),
+        ("answered", "disassemble"),
+        ("answered", "register_patch_site"),
+    ]
+    assert len([call for call in calls
+                if "already deferred" in json.dumps(call["payload"])]) == 1
+    assert flow.localized is not None
+
+
+def test_marker_patch_site_requires_request_to_call_evidence_chain():
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    handler_address = 0x41322C
+    site = 0x413540
+    function = {"start": handler_address, "end": 0x414BD0,
+                "name": None, "method": "start_candidate_heuristic"}
+    answers = [
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"},
+         "answer": {"matches": [{"address": string_address}]}},
+        {"query": {"op": "data_references", "address": string_address},
+         "answer": {"references": [
+             {"kind": "word", "vaddr": table_address}]}},
+        {"query": {"op": "data_table_context", "address": table_address},
+         "answer": {"words": [
+             {"vaddr": table_address, "value": string_address,
+              "classification": "ascii_pointer"},
+             {"vaddr": table_address + 4, "value": handler_address,
+              "classification": "executable_pointer", "function": function}]}},
+        {"query": {"op": "function_calls", "address": handler_address},
+         "answer": {"calls": [{"vaddr": site, "callee": "system"}]}},
+        {"query": {"op": "disassemble", "address": site, "around": 8},
+         "answer": {"window": {
+             "start": site - 16,
+             "end": site + 16,
+             "instructions": [{"vaddr": site}],
+         }}},
+    ]
+    reproduction = {
+        "confirmed_ids": ["trigger"],
+        "detail": [{"id": "trigger", "request": {
+            "method": "POST", "path": "/apc_client_pin.cgi",
+            "form": {"wps_pin": "12345670"}}}],
+    }
+    session = type("EvidenceSessionStub", (), {"answers": answers})()
+    entry = {"site": site, "callee": "system"}
+    fault = {"outcome": "command_injection_marker"}
+
+    accepted = FirmwareWorkflow._marker_site_evidence_eligibility(
+        entry, fault, session, reproduction, None)
+    assert accepted["decision"] == "accepted"
+    assert accepted["semantic_class"] == "marker_request_chain"
+    assert accepted["chain"]["site_call_observed"] is True
+
+    incomplete = type("EvidenceSessionStub", (),
+                      {"answers": answers[:-1]})()
+    deferred = FirmwareWorkflow._marker_site_evidence_eligibility(
+        entry, fault, incomplete, reproduction, None)
+    assert deferred["decision"] == "deferred"
+    assert deferred["semantic_class"] == "marker_request_chain_incomplete"
+    assert deferred["missing_evidence"] == ["disassemble_exact_site"]
+
+    no_disassembly = type("EvidenceSessionStub", (), {
+        "answers": [item for item in answers
+                    if item["query"].get("op") != "disassemble"]})()
+    deferred_without_disassembly = FirmwareWorkflow._marker_site_evidence_eligibility(
+        entry, fault, no_disassembly, reproduction, None)
+    assert deferred_without_disassembly["decision"] == "deferred"
+    assert deferred_without_disassembly["semantic_class"] == \
+        "marker_request_chain_incomplete"
+    assert deferred_without_disassembly["missing_evidence"] == [
+        "disassemble_exact_site"]
+
+    wrong_handler = type("EvidenceSessionStub", (), {
+        "answers": [item for item in answers
+                    if item["query"].get("op") != "disassemble"]})()
+    wrong_handler.answers[2]["answer"]["words"][1]["function"] = {
+        "start": handler_address + 0x1000,
+        "end": handler_address + 0x2000,
+    }
+    wrong = FirmwareWorkflow._marker_site_evidence_eligibility(
+        {"site": handler_address + 0x5000}, fault, wrong_handler,
+        reproduction, None)
+    assert wrong["decision"] == "rejected"
+    assert wrong["semantic_class"] == "marker_handler_does_not_contain_site"
+
+
+def test_marker_call_evidence_merges_broad_and_filtered_pages():
+    string_address = 0x457E84
+    table_address = 0x100007C8
+    handler_address = 0x412F0C
+    exact_site = 0x4131EC
+    other_site = 0x41368C
+    function = {"start": handler_address, "end": handler_address + 0x2000}
+    answers = [
+        {"query": {"op": "ascii_search", "text": "apc_client_pin.cgi"},
+         "answer": {"matches": [{"address": string_address}]}},
+        {"query": {"op": "data_references", "address": string_address},
+         "answer": {"references": [
+             {"kind": "word", "vaddr": table_address}]}},
+        {"query": {"op": "data_table_context", "address": table_address},
+         "answer": {"words": [
+             {"vaddr": table_address, "value": string_address,
+              "classification": "ascii_pointer"},
+             {"vaddr": table_address + 4, "value": handler_address,
+              "classification": "executable_pointer", "function": function},
+         ]}},
+        # The broad page exposes exact_site, then a later filtered page for a
+        # different command call must not replace that evidence.
+        {"query": {"op": "function_calls", "address": handler_address},
+         "answer": {"calls": [
+             {"vaddr": exact_site, "callee": "_system"},
+             {"vaddr": exact_site + 0x100, "callee": "get_cgi"},
+         ]}},
+        {"query": {"op": "function_calls", "address": handler_address,
+                    "contains": "system"},
+         "answer": {"calls": [{"vaddr": other_site, "callee": "_system"}]}},
+        {"query": {"op": "disassemble", "address": exact_site, "around": 8},
+         "answer": {"window": {
+             "start": exact_site - 16,
+             "end": exact_site + 16,
+             "instructions": [{"vaddr": exact_site}],
+         }}},
+    ]
+    reproduction = {
+        "confirmed_ids": ["trigger"],
+        "detail": [{"id": "trigger", "request": {
+            "method": "POST", "path": "/apc_client_pin.cgi",
+            "form": {"wps_pin": "12345670"}}}],
+    }
+    session = type("EvidenceSessionStub", (), {"answers": answers})()
+
+    result = FirmwareWorkflow._marker_site_evidence_eligibility(
+        {"site": exact_site, "callee": "_system"},
+        {"outcome": "command_injection_marker"}, session, reproduction, None)
+
+    assert result["decision"] == "accepted"
+    assert result["chain"]["site_call_observed"] is True
+
+
+def test_command_marker_requires_command_execution_sink():
+    system = FirmwareWorkflow._command_marker_sink_eligibility(
+        {"callee": "_system"})
+    state_lookup = FirmwareWorkflow._command_marker_sink_eligibility(
+        {"callee": "nvram_safe_get"})
+    unknown = FirmwareWorkflow._command_marker_sink_eligibility({"callee": None})
+
+    assert system is None
+    assert state_lookup["decision"] == "rejected"
+    assert state_lookup["semantic_class"] == "non_command_execution_callee"
+    assert unknown["decision"] == "deferred"
+    assert unknown["missing_evidence"] == [
+        "command_execution_callee_identity"]
 
 
 def test_fault_context_hex_aliases_do_not_add_unlisted_facts():
@@ -1886,6 +3330,77 @@ def test_propose_rejects_unselected_registered_site(fake_session, tmp_path):
     assert "22" * 16 not in prompt
 
 
+def test_wrapper_refinement_requires_previous_site_and_mode(
+        fake_session, tmp_path):
+    session, adapter = fake_session
+    poc = tmp_path / "wrapper-refinement-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, session / "rootfs", poc)
+    _wire_session(flow, session, adapter)
+    ledger = flow.ledger_for_target()
+    selected_id = _add_model_code_site(
+        ledger, site=0x400000, bytes_hex="11" * 16)
+    save_json(flow.root / "reproduce" / "1" / "fault-summary.json", {
+        "request": {"method": "GET", "path": "/trigger"},
+        "signal": "SIGSEGV", "exit_record": {"pid": 10}})
+    save_json(flow.root / "localize" / "result.json", {
+        "evidence": [selected_id], "reasoning": "selected", "queries": []})
+    _mark_localization_valid(flow, {
+        "evidence": [selected_id], "reasoning": "selected", "queries": []})
+    contract = {"abi": "inferred", "bounds": "bounded",
+                "preserve": "valid behavior", "invalid": "safe failure"}
+    source = "int repair_entry(void *p) { return p != 0; }"
+    flow.model.script(
+        "repair",
+        {"edits": [{"site": 0x400000, "expected_hex": "11" * 16,
+                    "evidence": [selected_id], "contract": contract,
+                    "source": source}]},
+        {"edits": [{"site": 0x400000, "expected_hex": "11" * 16,
+                    "evidence": [selected_id], "contract": contract,
+                    "mode": "wrapper", "source": source}]},
+    )
+    feedback = {
+        "retry_scope": "same_localization",
+        "controller_required_edits": [
+            {"site": 0x400000, "mode": "wrapper"}],
+    }
+
+    proposal = flow.propose(tmp_path / "rounds" / "002", feedback)
+
+    assert proposal["edits"][0] == {
+        "site": 0x400000, "expected_hex": "11" * 16,
+        "evidence": [selected_id], "mode": "wrapper",
+        "contract": contract, "source": source}
+    second_call = flow.model.calls[-1]["payload"]
+    assert second_call["feedback"]["controller_required_edits"] == \
+        feedback["controller_required_edits"]
+
+
+def test_wrapper_same_site_refinement_is_single_and_leaf_compatible():
+    wrapper = {"edits": [{"site": 0x413540, "mode": "wrapper"}]}
+    leaf = {"edits": [{"site": 0x413540, "mode": "leaf"}]}
+    triage = {"category": "pre_trigger_transport_failure"}
+
+    first = FirmwareWorkflow._wrapper_same_site_refinement(
+        wrapper, triage, refinements_used=0)
+    second = FirmwareWorkflow._wrapper_same_site_refinement(
+        wrapper, triage, refinements_used=1)
+    unrefinable = FirmwareWorkflow._wrapper_same_site_refinement(
+        wrapper, {"category": "new_fault_introduced"}, refinements_used=0)
+    marker = FirmwareWorkflow._wrapper_same_site_refinement(
+        wrapper, {"category": "marker_still_created"}, refinements_used=0)
+    old_path = FirmwareWorkflow._wrapper_same_site_refinement(
+        leaf, triage, refinements_used=0)
+
+    assert first["controller_required_edits"] == [
+        {"site": 0x413540, "mode": "wrapper"}]
+    assert first["wrapper_refinement"]["attempt"] == 1
+    assert second is None
+    assert unrefinable is None
+    assert old_path is None
+    assert marker is None
+
+
 def test_full_pipeline_happy_path(fake_session, tmp_path):
     """Inject model + fake session + REAL implant candidate bytes: the loop
     runs reproduce -> localize -> tests -> repair -> verify -> report."""
@@ -2163,18 +3678,57 @@ def test_candidate_failure_triage_separates_new_fault_from_unfixed(
             "signal_name": "SIGSEGV",
             "debug_context": {"pc": 1, "ra": 2},
         }])
+    pre_trigger = RepairError(
+        "verification_failed", "home: incomplete_response")
+    pre_trigger.verification_class = "pre_trigger_transport_failure"
+    transport = flow._candidate_failure_triage(pre_trigger, [])
 
     assert same["category"] == "same_fault_unfixed"
     assert new_signal["category"] == "new_fault_introduced"
     assert new_pc["category"] == "new_fault_introduced"
     assert functional["category"] == "functional_regression"
     assert generated_crash["category"] == "same_fault_unfixed"
+    assert transport["category"] == "pre_trigger_transport_failure"
     assert same["retry_scope"] == "relocalize"
     assert new_signal["retry_scope"] == "relocalize"
     assert new_pc["retry_scope"] == "relocalize"
     assert functional["retry_scope"] == "same_localization"
     assert generated_crash["retry_scope"] == "relocalize"
+    assert transport["retry_scope"] == "relocalize"
     assert {same["category"], new_signal["category"], functional["category"]}
+
+
+def test_candidate_replay_feedback_is_structured_and_neutral():
+    replay = {"results": [
+        {"id": "home", "status": "ok", "reason": None,
+         "http_status": 200, "delivery": {"receive": "eof"},
+         "marker_after": {"exists": False}},
+        {"id": "login", "status": "failed", "reason": "incomplete_response",
+         "http_status": None, "delivery": {"receive": "timeout"},
+         "marker_after": {"exists": False}},
+        {"id": "trigger", "status": "failed", "reason": "unexpected_marker",
+         "http_status": 200, "delivery": {"receive": "response"},
+         "marker_after": {"exists": True}},
+    ]}
+    plan = {"requests": [
+        {"id": "home", "expect": "response"},
+        {"id": "login", "expect": "response"},
+        {"id": "trigger", "expect": "marker_created"},
+    ]}
+
+    feedback = FirmwareWorkflow._candidate_replay_feedback(replay, plan)
+
+    assert feedback == [
+        {"id": "home", "status": "ok", "reason": None,
+         "expect": "response", "phase_position": "pre_trigger",
+         "http_status": 200, "receive": "eof", "marker_present": False},
+        {"id": "login", "status": "failed", "reason": "incomplete_response",
+         "expect": "response", "phase_position": "pre_trigger",
+         "http_status": None, "receive": "timeout", "marker_present": False},
+        {"id": "trigger", "status": "failed", "reason": "unexpected_marker",
+         "expect": "marker_created", "phase_position": "trigger",
+         "http_status": 200, "receive": "response", "marker_present": True},
+    ]
 
 
 def test_pre_ready_candidate_exit_relocalizes_with_sanitized_fault(
@@ -2287,6 +3841,146 @@ def test_repair_invalid_retries_proposal_at_same_localization(
     assert retry["retry_scope"] == "same_localization"
     assert "private path" not in json.dumps(retry)
     assert flow.report["rounds"][0]["status"] == "candidate_accepted"
+
+
+def test_semantic_rejection_relocalizes_without_deploying_candidate(
+        tmp_path, monkeypatch):
+    poc = tmp_path / "semantic-rejection-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, tmp_path / "unused-rootfs", poc,
+                         analysis_target=b"fixture")
+    flow.cfg["repair"]["max_rounds"] = 2
+    baseline = flow.session_dir / "rootfs" / "sbin" / "httpd"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_bytes(b"fixture")
+    flow.baseline_bytes.parent.mkdir(parents=True)
+    flow.baseline_bytes.write_bytes(b"fixture")
+    evidence = _add_model_code_site(flow.ledger_for_target())
+    result = {"evidence": [evidence], "reasoning": "selected", "queries": []}
+    _mark_localization_valid(flow, result)
+    calls = []
+    proposal_calls = 0
+    fresh_evidence = None
+    candidate = tmp_path / "semantic-rejection-candidate"
+    candidate.write_bytes(b"candidate")
+    candidate_sha = _sha_bytes(candidate.read_bytes())
+
+    def propose(_round_dir, feedback, **_):
+        calls.append(copy.deepcopy(feedback))
+        nonlocal proposal_calls
+        proposal_calls += 1
+        if proposal_calls == 1:
+            return {"edits": [], "rejection_reason": (
+                "A leaf replacement cannot preserve the valid PIN response while "
+                "blocking this command effect"),
+            "retry_scope": "relocalize"}
+        return {"edits": [{
+            "site": 0x400100, "expected_hex": "22" * 16,
+            "evidence": [fresh_evidence],
+            "contract": {"abi": "a0=dst a1=src", "bounds": "bounded",
+                         "preserve": "copies", "invalid": "returns 0"},
+            "source": "int repair_entry(char*d,const char*s){return 0;}",
+        }]}
+
+    def implant(proposal, *_args, **_kwargs):
+        calls.append({"kind": "implant", "site": proposal["edits"][0]["site"]})
+        save_json(_args[0] / "patch-record.json", {
+            "candidate_sha256": candidate_sha,
+            "site": proposal["edits"][0]["site"],
+        })
+        return {"candidate": candidate, "record": {
+            "candidate_sha256": candidate_sha,
+            "target_sha256": flow.ledger_for_target().target_sha,
+            "edits": [], "implants": []}}
+
+    def relocalize(feedback, **kwargs):
+        nonlocal fresh_evidence
+        fresh_evidence = _add_model_code_site(
+            flow.ledger_for_target(), site=0x400100, bytes_hex="22" * 16)
+        calls.append({"kind": "relocalize", "feedback": feedback, **kwargs})
+        _mark_localization_valid(flow, {
+            "evidence": [fresh_evidence], "reasoning": "fresh site",
+            "queries": [],
+            "selected_sites": [{
+                "evidence": fresh_evidence, "site": 0x400100,
+                "bytes_hex": "22" * 16,
+            }],
+        })
+
+    monkeypatch.setattr(flow, "propose", propose)
+    monkeypatch.setattr(flow, "implant", implant)
+    monkeypatch.setattr(flow, "relocalize", relocalize)
+    monkeypatch.setattr(flow, "_runtime_exit_cursor", lambda: 0)
+    monkeypatch.setattr(
+        flow, "deploy_and_verify",
+        lambda *_: {"candidate_sha256": candidate_sha, "verification": {}})
+    monkeypatch.setattr(flow, "finalize", lambda *_: None)
+
+    flow.repair_rounds()
+
+    assert flow.report["rounds"][0]["status"] == "site_semantics_rejected"
+    assert flow.report["rounds"][0]["site_semantics_rejected"][
+        "retry_scope"] == "relocalize"
+    assert flow.report["rounds"][1]["status"] == "candidate_accepted"
+    assert calls[1]["kind"] == "relocalize"
+    assert calls[1]["candidate"] is None
+    assert calls[1]["candidate_sha256"] is None
+    assert not (flow.root / "rounds" / "001" / "patch-record.json").exists()
+    assert (flow.root / "rounds" / "002" / "patch-record.json").exists()
+
+
+def test_repeated_semantic_rejection_does_not_observe_missing_candidate(
+        tmp_path, monkeypatch):
+    poc = tmp_path / "repeated-rejection-poc.py"
+    poc.write_text(POC_SOURCE)
+    flow = make_workflow(tmp_path, tmp_path / "unused-rootfs", poc,
+                         analysis_target=b"fixture")
+    flow.cfg["repair"]["max_rounds"] = 2
+    baseline = flow.session_dir / "rootfs" / "sbin" / "httpd"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_bytes(b"fixture")
+    flow.baseline_bytes.parent.mkdir(parents=True)
+    flow.baseline_bytes.write_bytes(b"fixture")
+    evidence = _add_model_code_site(flow.ledger_for_target())
+    _mark_localization_valid(flow, {
+        "evidence": [evidence], "reasoning": "selected", "queries": []})
+
+    rejection = {"edits": [], "rejection_reason": (
+        "The nominated site cannot preserve command semantics"),
+        "retry_scope": "relocalize"}
+
+    def propose(_round_dir, feedback, **_):
+        # The first round has no prior feedback; later rounds must.
+        if isinstance(feedback, dict):
+            assert feedback.get("retry_scope") in {
+                "same_localization", "relocalize"}
+        return copy.deepcopy(rejection)
+
+    def relocalize(feedback, **kwargs):
+        # Deliberately reuse the same site: the second rejection must become
+        # localization_failed before any candidate observation path runs.
+        current = json.loads(
+            (flow.root / "localize" / "result.json").read_text())
+        _mark_localization_valid(flow, current)
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("localization failure must not collect candidate exits")
+
+    monkeypatch.setattr(flow, "propose", propose)
+    monkeypatch.setattr(flow, "implant",
+                        lambda *_: pytest.fail("rejection must not build"))
+    monkeypatch.setattr(flow, "relocalize", relocalize)
+    monkeypatch.setattr(flow, "_collect_candidate_runtime_exits", fail_if_called)
+
+    with pytest.raises(
+            RepairError,
+            match="Repeated semantic rejection consumed") as caught:
+        flow.repair_rounds()
+
+    assert caught.value.status == "localization_failed"
+    assert flow.report["rounds"][0]["status"] == "site_semantics_rejected"
+    assert not (flow.root / "rounds" / "001" / "patch-record.json").exists()
+    assert not (flow.root / "rounds" / "002" / "patch-record.json").exists()
 
 
 @pytest.mark.parametrize("diagnostic,secret", [
@@ -2733,6 +4427,38 @@ def test_record_baseline_bytes_rejects_tampering(tmp_path):
     assert caught.value.status == "integrity_failed"
 
 
+def test_verify_firmware_run_uses_stored_check_protocol(tmp_path, monkeypatch):
+    """Offline verification must not validate modern checks as legacy HTTP."""
+    import repair_tool.firmware.case as case_module
+    import repair_tool.firmware.loop as loop_mod
+    from repair_tool.firmware.protocol import (
+        HTTP_ASCII_AUTH_FORM_MULTI_STEP_PORT80 as multi_step_protocol)
+
+    root = tmp_path / "run"
+    (root / "final").mkdir(parents=True)
+    save_json(root / "report.json", {
+        "kind": "firmware", "status": "validated_candidate"})
+    save_json(root / "final" / "candidate.json", {
+        "candidate_sha256": "0" * 64})
+    save_json(root / "config.json", {"firmware": {
+        "target": "sbin/httpd",
+        "protocol": multi_step_protocol,
+        "checks": [{"protocol": multi_step_protocol,
+                    "steps": [], "statuses": [200]}],
+    }})
+    captured = []
+
+    def validate(_checks, protocol=case_module.CURRENT_PROTOCOL):
+        captured.append(protocol)
+
+    monkeypatch.setattr(case_module, "_validate_checks", validate)
+
+    with pytest.raises(RepairError, match="Candidate binary missing"):
+        loop_mod.verify_firmware_run(root)
+
+    assert captured == [multi_step_protocol]
+
+
 def test_baseline_exit_restarts_under_transaction_before_holdout(fake_session, tmp_path):
     from repair_tool.firmware.rehost import SessionControl, SessionLock
     session, adapter = fake_session
@@ -2953,6 +4679,111 @@ def test_tests_prompt_carries_trigger_requests():
     assert "path" in rendered and "method" in rendered
 
 
+def test_marker_tests_must_preserve_confirmed_trigger_scenario():
+    from repair_tool.firmware.tests import (
+        required_trigger_scenarios, tests_prompt, validate_tests)
+
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/",
+             "capture_fields": ["nonce"], "expect": "response", "form": {}},
+            {"id": "framed_page", "method": "GET", "path": "/framed.asp",
+             "statuses": [200], "contains": "ready", "accept_timeout": True,
+             "expect": "response", "form": {}},
+            {"id": "marker_trigger", "method": "POST", "path": "/run.cgi",
+             "form": {"nonce": {"capture": "nonce"}, "cmd": "';>/Q ;#"},
+             "expect": "marker_created", "capture_fields": []},
+        ],
+        "confirmations": ["marker_trigger"]}
+    reproduction = {
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "confirmed_ids": ["marker_trigger"],
+        "detail": plan["requests"]}
+    required = required_trigger_scenarios(reproduction, plan)
+    prompt = tests_prompt(reproduction, "checks", plan)
+
+    assert prompt["confirmed_trigger_scenarios"] == required
+    assert "/run.cgi" in json.dumps(prompt)
+    assert "nonce" in json.dumps(prompt)
+
+    explicit_default_content_type = copy.deepcopy(plan["requests"])
+    explicit_default_content_type[2]["content_type"] = \
+        "application/x-www-form-urlencoded"
+    good = {"tests": [
+        {"id": "home-ok", "kind": "regression", "expect": "pass",
+         "basis": "home", "request": {"method": "GET", "path": "/"},
+         "response": {"statuses": [200]}},
+        {"id": "framed-page", "kind": "regression", "expect": "pass",
+         "basis": "confirmed framed page",
+         "steps": [{"id": "framed", "method": "GET", "path": "/framed.asp"}],
+         "protocol": plan["protocol"],
+         "response": {"statuses": [200]}},
+        {"id": "marker-vuln", "kind": "vulnerability", "expect": "marker",
+         "basis": "confirmed trigger",
+         "steps": explicit_default_content_type,
+         "protocol": plan["protocol"], "marker": "/Q"},
+        {"id": "holdout", "kind": "independent", "expect": "pass",
+         "basis": "holdout", "request": {"method": "GET", "path": "/h"},
+         "response": {"statuses": [200]}},
+    ]}
+    validated = validate_tests(
+        good, required_trigger_scenarios=required)
+    assert len(validated) == 4
+    framed = next(test for test in validated if test["id"] == "framed-page")
+    assert framed["steps"][0]["accept_timeout"] is True
+    assert framed["steps"][0]["contains"] == "ready"
+
+    # The controller may materialize a trigger that the model identifies by
+    # its confirmed final request, but it must not trust a retyped prefix or
+    # accept a changed payload as the same trigger.
+    normalized = copy.deepcopy(good)
+    normalized["tests"][1]["request"] = {}
+    trigger = plan["requests"][-1]
+    normalized["tests"][2]["steps"] = [{
+        "id": "marker_trigger", "method": trigger["method"],
+        "path": trigger["path"], "form": trigger["form"],
+        "form_encoding": "application/x-www-form-urlencoded"}]
+    canonical = validate_tests(normalized, required_trigger_scenarios=required)
+    assert canonical[2]["steps"] == required[0]["steps"]
+
+    near_miss_payload = copy.deepcopy(normalized)
+    near_miss_payload["tests"][2]["steps"][0]["form"] = {
+        "cmd": "safe"}
+    with pytest.raises(RepairError, match="verbatim"):
+        validate_tests(near_miss_payload, required_trigger_scenarios=required)
+
+    ambiguous = copy.deepcopy(normalized)
+    ambiguous["tests"][1]["request"] = {"method": "GET", "path": "/"}
+    with pytest.raises(RepairError, match="exactly one of request or steps"):
+        validate_tests(ambiguous, required_trigger_scenarios=required)
+
+    reference_only = copy.deepcopy(good)
+    reference_only["tests"][1]["steps"] = [
+        {"id": "home"}, {"id": "marker_trigger"}]
+    with pytest.raises(RepairError, match="explicit absolute path"):
+        validate_tests(reference_only, required_trigger_scenarios=required)
+
+    near_miss = copy.deepcopy(good)
+    near_miss["tests"][2]["steps"][2]["path"] = "/safe.cgi"
+    with pytest.raises(RepairError, match="verbatim"):
+        validate_tests(near_miss, required_trigger_scenarios=required)
+
+    conflicting = copy.deepcopy(good)
+    conflicting["tests"][1]["steps"].append({
+        "id": "final-submit", "method": "POST", "path": "/submit.cgi",
+        "statuses": [200], "contains": "saved",
+        "accept_timeout": True, "expect": "response",
+        "form": {"saved": "1"}, "capture_fields": []})
+    conflicting["tests"][1]["response"] = {
+        "statuses": [200], "contains": "ready"}
+    with pytest.raises(RepairError, match="conflicting contains"):
+        validate_tests(conflicting, required_trigger_scenarios=required)
+
+
 def test_reproduce_summary_records_request_paths(tmp_path):
     """Audit issue 1 data source: execute_plan results must keep the
     concrete request so later stages can cite it."""
@@ -3070,6 +4901,12 @@ def test_parse_model_queries_shapes():
     assert parse_model_queries(nested) == [
         {"op": "disassemble", "site": 4226592, "around": 128},
         {"op": "disassemble", "site": 4236836, "around": 96}]
+    # Exact decision-envelope variant produced by GLM-5.3: the selected call
+    # entry was correct, but it was nested under register_patch_site and the
+    # decimal address was represented as a string.
+    registration = {"register_patch_site": {"address": "4273472"}}
+    assert parse_model_queries(registration) == [
+        {"op": "register_patch_site", "address": 4273472}]
     # Not a query at all -> None (evidence citation path).
     assert parse_model_queries({"evidence": ["e3"], "reasoning": "r"}) is None
     with pytest.raises(RepairError, match="non-empty list"):

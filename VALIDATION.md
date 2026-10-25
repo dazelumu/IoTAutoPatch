@@ -194,6 +194,235 @@
 
 超时修复后的最终 0.3.0 包以 `dist/project-vuln-repair-0.3.0.zip.sha256` 为准；本页不复制最终自引用 checksum。
 
+## wrapper 同位点修正与 relocalize 预算补充
+
+2026-10-22 针对 CVE-2024-57595 的真实失败证据补充以下控制逻辑：
+
+- wrapper 候选因正常控制请求被破坏、触发请求传输/功能失败、marker 仍创建或生成测试回归而失败时，先保留原 site 和 `mode=wrapper`，给模型一次只修正 `repair_entry` 判定逻辑的机会；第二次失败仍按旧策略 relocalize，leaf 候选不启用该重试。
+- 同位点修正由控制器硬校验：模型不能把该修正换成新 site 或 leaf；如果证明该调用层无法保留必要行为，仍必须使用 semantic rejection。
+- 修正提示包含模型上一版 `repair_entry` 源码、结构化 replay/测试反馈，并明确禁止“整条厂商命令出现任意 shell 元字符就阻断”的粗策略。
+- regression/independent 的 pass 测试复用已确认恶意触发时，在 baseline oracle 前直接判为测试设计错误；若变体仍进入 oracle，反馈会明确 marker 触发不能作为 pass 测试。
+- relocalize 默认查询预算调整为 16；案例 YAML 显式配置仍优先，当前 CVE-2024-57595 案例若写为 8，需要按续测命令改为 16。
+- wrapper patch record 记录最终写入 candidate 的 implant bytes、改写前 bytes、原 callee GOT offset、改写后的 load 指令和 trampoline offset，避免审计记录与候选二进制不一致。
+
+定向验证在 Ubuntu-24.04 / WSL 的项目测试虚拟环境中执行，pytest 临时目录位于 Ubuntu 原生 `/home/lumu/tmp`：
+
+- 精确节点组合首轮 **13 passed, 1 failed**；唯一失败是新增 prompt 测试断言未考虑提示文本换行，修正测试断言后该用例单独复跑通过。
+- 相关覆盖包括 wrapper 植入和原调用保留、leaf 旧失败路径、同 site/mode 硬约束、pass 测试复用恶意触发拒绝、marker 验证分类、配置默认值与案例覆盖、patch record 和 proposal prompt。
+- 修改模块与测试执行 `python -m py_compile` 通过；`git diff --check` 通过。
+- 重新执行 `python scripts/package.py` 与 `python scripts/package.py --check`，生成并校验 **127 个文件**的 0.3.0 包。
+
+本补充未部署 WSL 固定安装路径，未执行全量回归，未调用真实模型，也未运行新的 `repair run` 或独立 verify。
+
+## baseline 复用与受控重试补充
+
+2026-10-22 针对 CVE-2024-57595 真实 run `20261022-181026-c76a4396` 暴露的冗余 `httpd-2` 重启和 `httpd-3` readiness 前崩溃补充以下控制逻辑：
+
+- `baseline-fixed-checks` 在执行前先读取当前 live target 身份；PID/SHA 均仍绑定到 baseline 时直接复用该实例，不再无条件重启。
+- 当前 target 缺失、SHA 不匹配或身份查询失败时，仍按原安全规则重启到 baseline。
+- baseline 重启若因 `target_start_failed` 失败，只立即受控重试一次；第一次失败的 launch exit 以 PID、信号、阶段和 PC/RA 等中性字段保存到 warning，不携带本地日志路径。
+- 非 `target_start_failed` 不重试；连续第二次启动失败直接失败并保留第一次 warning。
+- 候选 replace/restart 与候选 pre-ready 崩溃不启用该重试。候选启动失败仍作为候选失败证据进入 failure triage / relocalize，不会被 baseline 重试掩盖。
+- 复现成功后的 baseline 恢复同样复用该受控重启入口。
+
+定向验证在 Ubuntu-24.04 / WSL 的项目测试虚拟环境中执行，pytest 临时目录位于 Ubuntu 原生 `/home/lumu/tmp`：
+
+- `python -m pytest tests/test_firmware_loop.py -q -k "baseline_checks_reuse_ready_baseline_without_extra_restart or baseline_checks_restart_when_live_target_is_wrong or baseline_restart_retries_one_target_start_failure or baseline_restart_does_not_retry_non_start_or_repeated_failure or pre_ready_candidate_exit_relocalizes_with_sanitized_fault or reproduction_failure_surfaces_restart_failure"` — **6 passed**。
+- `python -m py_compile repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+- `git diff --check -- repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+- 重新执行 `python scripts/package.py` 与 `python scripts/package.py --check`，生成并校验 **127 个文件**的 0.3.0 包；最终 checksum 以 `dist/project-vuln-repair-0.3.0.zip.sha256` 为准。
+
+本节只证明源码逻辑与定向测试。该 baseline 复用/重试修复尚未部署到 WSL 固定安装路径，尚未通过新的真实 CVE-2024-57595 run 验证，未执行全量回归，也未调用模型。
+
+## wrapper 参数保存与 semantic rejection 合同修复
+
+2026-10-22 分析真实 run `20261022-183103-44c71de6` 后修复两个问题：
+
+- 第 1、2 轮 wrapper 候选都在合法 PIN 请求上出现 `valid_pin_control: incomplete_response`。第 2 轮判定函数对合法 PIN 明确返回 0，本应原样调用原函数；根因是 controller 生成的 trampoline 调用 `repair_entry` 后未恢复 MIPS o32 参数寄存器。`repair_entry` 可以破坏 `$a0-$a3`，随后尾跳原函数时原 callee 收到损坏参数。
+- trampoline 现在在调用判定函数前保存 `$ra/$gp/$a0-$a3`，调用后恢复全部参数，再根据返回值尾跳原 callee 或阻断。
+- 第 3 轮模型返回了 `edits=[] + rejection_reason + retry_scope` 的正确 semantic rejection 形式，但顶层合同校验先按普通 edits 提案拒绝这两个字段。现在空 edits 会先进入既有 semantic rejection 校验；非空 edits 携带 semantic rejection 字段仍被拒绝。
+- 保留候选启动安全规则，不改变 relocalize 的 fresh site 要求。
+
+定向验证：
+
+- Ubuntu-24.04 / WSL 既有测试虚拟环境：
+  `pytest tests/test_firmware_implant.py -k "wrapper_preserves_original_arguments_across_helper_call or wrapper_implant_preserves_original_call or semantic_rejection_top_level_contract"` — **3 passed**。
+- 新增用例中的判定函数显式清空 `$a0/$a1`，若 trampoline 不恢复参数则两个原调用都会跳过副作用；修复后 QEMU 仍保留原调用副作用。
+- Ubuntu-24.04 / WSL：
+  `pytest tests/test_firmware_loop.py -k "semantic_rejection_relocalizes_without_deploying_candidate or repeated_semantic_rejection_does_not_observe_missing_candidate"` — **2 passed**。
+- 未执行全量回归，未部署新版，未再次调用真实模型。
+
+## 测试生成 canonical 触发场景归一化
+
+2026-10-22 分析真实 run `20261022-185908-d1654e62` 后修复测试生成阶段的重复失败：
+
+- 该 run 的 PoC 复现、baseline fixed checks 和 localization 均已完成；失败发生在 `generate-tests`，最终 `contract_information_required`。
+- 4 次模型输出中，第 1 次为 JSON 语法错误；第 2 次漏洞场景已完全匹配但部分测试携带无语义空占位；第 3 次把需要认证/timeout 前缀的页面压缩成独立请求；第 4 次漏洞测试遗漏 host/form/step expect 等默认字段，触发“必须逐字复放确认场景”校验。
+- `tests_prompt()` 继续提供 controller-owned `confirmed_trigger_scenarios`，并明确要求复制该对象而不是重新默写。
+- validator 现在丢弃空 `request:{}` 或空 `steps:[]` 占位；两个非空表示仍会被拒绝。
+- 接受 `form_encoding` 作为 `content_type` 的无歧义别名，随后仍进入封闭字段和值校验。
+- 当 marker 漏洞测试的 marker、最终 method/path/form 与确认触发场景完全一致时，控制器用自己保存的 canonical 多步场景替换模型重述的前缀。模型修改 payload、path 或 marker 时不会归一化，仍按 near-miss 拒绝。
+- 需要认证或 `accept_timeout=true` 的路径仍禁止压缩成独立 request，安全规则未放宽。
+
+定向验证：
+
+- Ubuntu-24.04 / WSL 既有测试虚拟环境：
+  `pytest tests/test_firmware_loop.py -k marker_tests_must_preserve_confirmed_trigger_scenario` — **1 passed**。
+- 用该真实 run 的 4 次原始模型输出回放新 validator：
+  - 第 1 次：仍因 JSON 语法错误拒绝；
+  - 第 2 次：通过，生成 4 个测试；
+  - 第 3 次：仍因压缩确认多步路径拒绝；
+  - 第 4 次：通过，生成 4 个测试。
+- 未执行全量回归，未部署新版，未再次调用真实模型。
+
+## candidate 传输重试与 marker 错位 site 修正
+
+2026-10-22 继续分析真实 run `20261022-193857-68a86758` 和无模型对照诊断：
+
+- 无模型 QEMU 诊断确认 `/Q` marker 确实来自 shell `open("/Q", O_WRONLY|O_CREAT|O_TRUNC)`；诊断脚本最初漏传 candidate marker，后续修正后重新判定。
+- 在模型曾选择的 `0x00413540` 部署“包含 `/Q` 即阻断”的 wrapper，合法 PIN 可通过但 marker 仍会创建；该 site 未拦截确认触发流。
+- 在 handler `0x00412f0c` 内的 `0x004131ec` 部署同一 wrapper，合法 PIN 通过且 candidate 阶段 marker 不再创建。该结果证明 wrapper/trampoline、参数恢复和原调用保留机制可用，失败主因是 localization 选错 command sink。
+
+依据上述证据调整控制策略：
+
+- marker replay 中仅当候选 SHA 身份稳定、失败仅为 `incomplete_response` 且没有任何进程退出时，允许一次审计记录的同 SHA candidate restart 后重放。该规则只作用于 candidate 已完成 fixed checks 后的 replay，不改变候选 pre-ready 崩溃不可重试的安全边界。
+- marker 仍创建、响应语义失败或进程退出均不允许 transport retry，保留为决定性候选失败。
+- `marker_still_created` 不再触发 wrapper 同 site predicate 修正，直接 relocalize；该类反馈明确提示旧 wrapper site 未拦截确认 marker，应重新对已恢复 handler 做窄过滤 `function_calls` 并选择另一个 command sink。
+- 反馈记录失败 wrapper site 和 mode，避免模型重复注册同一错误位点；仍要求 fresh `register_patch_site`，不向模型提供控制器硬编码答案。
+
+定向验证在 Ubuntu-24.04 / WSL 项目测试虚拟环境执行：
+
+- `pytest tests/test_firmware_verification_safety.py tests/test_firmware_loop.py::test_wrapper_same_site_refinement_is_single_and_leaf_compatible tests/test_firmware_loop.py::test_candidate_failure_triage_separates_new_fault_from_unfixed -q --basetemp=/home/lumu/tmp/pytest-marker-retry-focused` — **19 passed**。
+- `py_compile repair_tool/firmware/verify.py repair_tool/firmware/loop.py tests/test_firmware_verification_safety.py tests/test_firmware_loop.py` — 通过。
+- `git diff --check`（限定上述修改文件） — 通过。
+- 重新执行 `python scripts/package.py` 与 `python scripts/package.py --check` — 生成并校验 **127 个文件** 的 0.3.0 包；最终 checksum 以 `dist/project-vuln-repair-0.3.0.zip.sha256` 为准。
+
+本节的无模型诊断只证明 `0x004131ec` 对当前 CVE-2024-57595 触发流有效，不把它写入通用核心或跳过模型 fresh localization。尚未用新版执行真实 `repair run`，未执行全量回归，未调用模型。
+
+## marker 数据表 handler 覆盖门禁
+
+2026-10-22 分析真实 run `20261022-205754-c24ef788` 后补充控制器级约束：
+
+- 该 run 的 PoC 复现、baseline fixed checks、16 次静态查询和 9 次模型调用均完成；失败主因是模型在 `data_table_context` 同时恢复 `0x0041322c` 与 `0x00412f0c` 两个 executable handler 后，只检查前者并把剩余预算用于错误 handler 的 sink 反汇编，最终诚实报告证据不足。
+- 新增通用 marker handler coverage 状态：仅当确认故障为 `command_injection_marker`，且模型已经通过确认请求 path/form 字符串的 `ascii_search -> data_reference -> data_table_context` 链恢复出相邻 executable pointer 时才启用。
+- 对每个确认字符串的 bounded window 只取最近的左右 executable handler，最多 8 个；地址全部来自模型已经收到的查询答案，不写入 DIR-825 profile 地址，也不把这些 handler 宣称为补丁点。
+- 未覆盖 handler 前，控制器拒绝无关 `disassemble`、`register_patch_site` 和 “证据不足”结论；拒绝被写入 query trace，且不消耗主定位查询预算。反馈明确列出未覆盖 handler 的来源和必查 `function_calls` 地址。
+- `function_calls` 覆盖规则为：带 `contains` 的过滤查询必须返回至少一个 call；过滤空结果不算覆盖。未过滤查询即使为空也可作为该 handler 无调用的中性证明。
+- 覆盖完成后，模型仍必须自己筛选 sink、反汇编精确 site、执行 fresh `register_patch_site` 并输出结论；控制器不指定 site 或补丁模式。
+
+定向验证在 Ubuntu-24.04 / WSL 的项目测试虚拟环境执行，pytest 临时目录位于 Ubuntu 原生 `/home/lumu/tmp`：
+
+- 新增 helper 与集成测试：
+  `python -m pytest tests/test_firmware_loop.py -q -k "marker_handler_coverage or localization_marker_gate"` — **2 passed**。
+- 现有 marker/localize 相关回归子集：
+  `python -m pytest tests/test_firmware_loop.py -q -k "marker or localize"` — **19 passed, 80 deselected**。
+- `python -m py_compile repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+- `git diff --check -- repair_tool/firmware/loop.py tests/test_firmware_loop.py VALIDATION.md` — 通过。
+- 重新执行 `python scripts/package.py` 与 `python scripts/package.py --check` — 生成并校验 **127 个文件**的 0.3.0 包；最终 checksum 以 `dist/project-vuln-repair-0.3.0.zip.sha256` 为准。
+
+本节只证明源码逻辑和定向测试。该覆盖门禁尚未部署到 WSL 固定安装路径，尚未用新的真实 CVE-2024-57595 run 验证，未执行全量回归，也未调用模型。
+
+## marker 候选验证窗口与 relocalize 证据合并修复
+
+2026-10-22 继续分析真实 run `20261022-215428-bddc458c`：
+
+- 两轮 wrapper 候选都完成编译、植入、部署和身份校验，目标无崩溃、candidate SHA 稳定，但 `valid_pin_control` 在 5 秒 exploratory 窗口内被误判为 `incomplete_response`。baseline 复现与独立诊断均显示同一合法 PIN 请求需要接近案例的 15 秒请求预算；候选行为验证现在直接使用 `firmware.poc_request_timeout`，不再用较短的 exploratory 值做最终功能判定。旧配置键仅保留兼容，报告中同时记录 `observation_seconds` 和旧字段。
+- 同一 handler 的 `function_calls` 宽泛分页与后续 `contains=system` 过滤结果现在合并保留，不再让过滤结果覆盖先前已经看到的 exact call site。该 run 中 `e26` 曾暴露 `0x00413338`，随后 `e32` 的过滤结果把它从 eligibility 状态中抹掉，导致重复注册。
+- 已 deferred 的 nomination 会记录原 site entry 和缺失证据；同一 site 在缺失证据未补齐前重复提交会被拒绝且不消耗主查询预算。补齐只读证据后允许重新注册。
+- 对 `command_injection_marker`，已知非 command-execution callee（如 `nvram_safe_get`）不能仅凭 request-handler exact-call 链注册为修复点；无 callee 身份时先 deferred。该约束基于漏洞类别通用生效，不写入 DIR-825 地址。
+
+定向验证在 Ubuntu-24.04 / WSL 的项目测试虚拟环境执行，pytest 临时目录位于 Ubuntu 原生 `/home/lumu/tmp`：
+
+- 核心新增/受影响用例：
+  `pytest tests/test_firmware_loop.py -q -k "candidate_iteration_uses_full_request_observation_window or marker_call_evidence_merges_broad_and_filtered_pages or command_marker_requires_command_execution_sink or duplicate_deferred_nomination_does_not_burn_query_budget or localization_marker_gate_rejects_bypass_without_charging_budget"` — **5 passed, 97 deselected**。
+- marker 子集复验：
+  `pytest tests/test_firmware_loop.py -q -k "marker"` — **7 passed, 95 deselected**。
+- `python -m py_compile repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+- `git diff --check -- repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+
+本节尚未重新打包、尚未部署 WSL 固定安装路径、尚未执行全量回归、尚未调用真实模型，也不能把上一轮真实 run 解释为新逻辑的成功证据。
+
+## runtime sink differential probe
+
+2026-10-23 针对 CVE-2024-57595 多个静态 `system/_system` 调用点实现受控差分探测：
+
+- 仅当确认故障为 `command_injection_marker` 时启用。首轮 localize 在 marker handler 覆盖完成且模型已看到至少两个 redirectable command sink 后动态执行一次；relocalize 阶段仍可在候选失败后使用剩余候选继续探测。
+- 候选只来自 evidence ledger 中模型已经收到的 baseline `function_calls` 答案，必须是 redirectable command-execution 调用；真实候选反馈中已失败的 wrapper site 会被排除。控制器不写入 DIR-825 地址，也不把探测结果变成补丁答案。
+- 每个探测使用控制器固定生成的 wrapper：发现 shell 元字符返回非零阻断原调用，否则返回 0 保留原调用。模型不能提供该诊断 wrapper 的判定代码。
+- 探测在私有 session 副本上部署，只重放 reproduction 已确认的 marker 触发步骤，观察 marker 是否消失、目标身份是否稳定和失败步骤状态；随后必须回滚 baseline。回滚失败记录为 `infrastructure_failed`，不允许被后续步骤掩盖。
+- 探测结果写入 `runtime_sink_probe` evidence 与 `runtime-sink-probes/` 工件，并提供给后续重定位 prompt；结果标记为 diagnostic-only，不能替代新鲜 `register_patch_site`。
+- 默认 `firmware_runtime_sink_probe_limit=3`，找到 marker 被阻断的 site 后停止后续探测。
+- 修复部署 RPC 哈希读取：probe 现在校验 `replace_target()` 返回的 `target.sha256`，而不是顶层不存在的 `sha256` 字段；部署后成功回滚记录为 `baseline_restored`。
+
+2026-10-23 依据真实 run `20261023-002636-64322675` 继续收口四个控制流问题：
+
+- marker handler coverage 在 reproduction 缺少 confirmed request 明细时，会使用 `fault.request` 中已被 marker 复现确认的同一个请求作为兜底；地址仍只能来自模型已收到的静态查询答案，不引入设备地址。
+- nomination 被 deferred 后进入 `registration_recovery_required`：下一轮允许精确 site 反汇编或对应 handler 的 `function_calls`，拒绝无关宽泛查询和重复注册；重复注册保留 `already deferred`、缺失证据和 `budget_charged=false` 语义，不消耗主查询预算。对没有函数元数据的 stripped ELF，可从已返回的 `function_calls` 页面恢复暴露该 site 的查询地址。
+- 最终 localization 写入前重新执行语义门禁；cited `model_code_site` 若仍是 deferred/rejected，会被持久化为对应 nomination 状态并拒绝写入成功定位，防止绕过 registration gate。
+- marker 查询策略明确优先 `function_calls(handler, contains="system")`，过滤为空才扩展 `_system/popen/exec` 或宽泛分页；同参数重复查询会继续消耗预算，必须在 `next_offset` 或过滤条件上推进。
+- 首轮 localize 的 runtime sink probe 改为动态触发：本轮 `function_calls` 答案写入 ledger 后重新计算候选，在 handler coverage 已闭合、确认 marker、模型可见 command sink 至少两个时执行一次受控探测，并把 diagnostic-only 结果放入下一轮 prompt。
+
+定向验证在 Ubuntu-24.04 / WSL 既有项目测试虚拟环境执行，pytest 临时目录位于 Ubuntu 原生 `/home/lumu/tmp`：
+
+- `pytest tests/test_firmware_loop.py tests/test_firmware_verification_safety.py -q -k "marker_handler_coverage or registration_recovery or runtime_sink_probe or runtime_probe_candidates or marker or candidate_iteration_uses_full_request_observation_window or marker_call_evidence_merges_broad_and_filtered_pages or command_marker_requires_command_execution_sink or duplicate_deferred_nomination" --basetemp=/home/lumu/tmp/pytest-four-fixes-final` — **21 passed, 105 deselected**。
+- `python -m py_compile repair_tool/config.py repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+- `git diff --check -- repair_tool/config.py repair_tool/firmware/loop.py tests/test_firmware_loop.py docs/ARCHITECTURE.md VALIDATION.md` — 通过。
+- 重新执行 `python scripts/package.py` 与 `python scripts/package.py --check` — 生成并校验 **127 个文件**的 0.3.0 包；交付时以同目录 `project-vuln-repair-0.3.0.zip.sha256` 的实际值为准。
+
+本节只证明源码逻辑和定向测试。runtime sink probe 尚未部署到 WSL 固定安装路径，尚未通过新的真实 CVE-2024-57595 run 验证，未执行全量回归，也未调用模型。
+
+## runtime sink probe 完整场景重放修复
+
+2026-10-23 分析真实 run `20261023-012839-580c22a7` 后修复诊断探针自身的误导性结果：
+
+- PoC 复现计划包含 `home -> login -> authenticated_page -> valid_pin_control -> marker_trigger -> post_trigger_control` 六步；`reproduction.confirmed_ids` 只记录最终确认步骤 `marker_trigger`。旧实现错误地用该集合筛选计划，导致 runtime probe 只发送最终恶意 PIN POST，没有先捕获 `graph_id`、登录和进入认证页面。
+- 三个静态 command sink 的 probe 均在 `marker_trigger` 得到 `incomplete_response`，却被记录为 `marker_blocked=false`、`marker_present=false`。模型据此把历史验证有效的 `0x004131ec` 也理解为“未拦截”，最终在 16/16 查询耗尽后诚实拒绝定位。
+- probe 场景现在从已验证计划第一步切片到最后一个确认的 `marker_created` 步骤，保留 capture fields、cookies 和认证前缀；确认步骤之后的控制请求不参与诊断触发。
+- `incomplete_response`、HTTP/内容/cookie/capture 字段失败现在归类为 `transport_or_session_failure`，结论为 `inconclusive`，`marker_blocked` 与 `marker_present` 均为 `null`，不再冒充“未阻断”或“marker 不存在”。
+- marker 仍被创建时明确记录 `marker_present=true`、`marker_blocked=false`；场景完整且 marker 不存在才记录 `marker_blocked=true`。目标崩溃等其他候选失败仍为 `inconclusive`。
+- 同一探测阶段出现 `transport_or_session_failure` 时立即停止后续 sink，写入 warning，避免把同一个无效场景重复烧完 3 个候选。
+- 复查同类错误后进一步收口：传给模型的 runtime probe 投影保留 `failure_kind` 和 `failed_steps`；此前差分探针已证明 `marker_present=true` 的 site 不再进入后续候选；candidate replay 的受控传输重试若仍失败，分类使用第一次可重试失败的位置，避免第二次执行推进到更晚步骤后把诊断从 pre-trigger 误标为 trigger。
+
+定向验证在 Ubuntu-24.04 / WSL 既有项目测试虚拟环境执行，pytest 临时目录位于 Ubuntu 原生 `/home/lumu/tmp`：
+
+- `pytest tests/test_firmware_loop.py -q -k runtime_sink_probe --basetemp=/home/lumu/tmp/pytest-runtime-probe2` — **7 passed, 105 deselected**。
+- 同类错误复查子集：
+  `pytest tests/test_firmware_loop.py -q -k "runtime_sink_probe or runtime_probe_candidates" --basetemp=/home/lumu/tmp/pytest-similar-errors-a3` — **9 passed, 104 deselected**。
+  `pytest tests/test_firmware_verification_safety.py -q -k "transport_retry or transport_failure or marker_still_created" --basetemp=/home/lumu/tmp/pytest-similar-errors-b3` — **4 passed, 14 deselected**。
+- `python -m py_compile repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+- `git diff --check -- repair_tool/firmware/loop.py tests/test_firmware_loop.py docs/ARCHITECTURE.md VALIDATION.md` — 通过。
+
+本节修复后的包尚未部署到 WSL 固定安装路径，尚未再次调用真实 GLM-5.3，也未执行全量回归。旧 run 中“`0x004131ec` 可拦截当前 marker”的结论只保留为此前无模型诊断证据，不能当作新版真实修复成功。
+
+## offline verify 多步 fixed-check 协议兼容
+
+2026-10-23 真实 run `20261023-015556-7ca0e8ea` 已得到 `validated_candidate` 后，独立 `repair verify` 首次在离线校验处失败：
+
+- run 内部证据完整：final rollback/redeploy、fixed checks、marker replay 和 4 个生成测试均通过；失败不是候选证据被篡改。
+- `verify_firmware_run()` 校验存储 fixed checks 时未传入 run config 中的 `http-ascii-auth-form-multi-step-port80`，导致 `_validate_checks()` 回退到默认 `http-ascii-get-head-port80`，随后拒绝同一协议的合法多步 check。
+- 现在离线 verify 会按 `firmware.protocol`（缺省才是旧 GET/HEAD 协议）校验 stored checks。
+
+定向验证：
+
+- Ubuntu-24.04 / WSL：
+  `pytest tests/test_firmware_loop.py -q -k "verify_firmware_run or record_baseline_bytes" --basetemp=/home/lumu/tmp/pytest-verify-protocol` — **2 passed, 112 deselected**。
+- `python -m py_compile repair_tool/firmware/loop.py tests/test_firmware_loop.py` — 通过。
+
+## CVE-2024-57595 真实闭环与团队案例归档
+
+2026-10-23 真实 run `20261023-015556-7ca0e8ea` 在 0.3.0 固定安装中完成闭环：
+
+- PoC 复现：六步首页字段捕获、登录、认证页确认、合法 PIN、8 字节注入 PIN 和触发后控制全部通过；baseline 中 `wps_pin=';>/Q ;#` 创建 `/Q`。
+- 模型定位：GLM-5.3 通过受限 ELF 查询定位 `0x004131ec` 的 `_system` 调用，并完成本会话 fresh `register_patch_site`。
+- runtime sink differential probe：完整重放认证前缀和 marker 触发步骤，证明阻断该调用后 marker 消失、目标身份稳定，并成功回滚 baseline；该证据保持 diagnostic-only。
+- 修复：模型提交 `mode=wrapper`，模型函数仅判定 shell 元字符；控制器生成 trampoline，合法命令重调原 `_system`，恶意命令直接返回，不再破坏合法 PIN 保存。
+- 最终验证：固定检查 1/1，marker replay 稳定，生成测试 4/4，状态 `validated_candidate`。
+- 独立 verify：修复 offline fixed-check 协议兼容问题后，对同一 run 复核为 `verified_with_cleanup_warnings`。回滚 baseline、基线漏洞复现、候选重部署、fixed checks、marker replay 和 4 个测试均通过；两个 warning 均为非 root 进程无法删除 root 持有的临时 `host-rootfs` 目录。
+
+团队归档目录为 `cases/dlink/dir825b-2.03/cve-2024-57595/`，已保留声明式 PoC、输入模板、模型 proposal、`repair.c`、`repair.o`、实际 patched candidate、patch record、run 报告、生成测试、定位与差分探测结果、独立验证证据和团队摘要。已校验 candidate SHA256 为 `9045157760a96ef8b8a046b3f1d90356960e5ec05b86fda62fc445276c5798bf`，源码与对象 SHA256 分别为 `f95f9a690791818580ac55feed80f2bc2c6f325e57149622045a74cefc2976aa`、`094d18d81fc030d918ebb89b23f5e43f61a540ae739fd598e56b0d4b1d5543e6`。
+
+归档整理已完成个人路径、挂载路径和 API key 扫描，未发现泄漏；未保存原始固件、rootfs、完整模型响应或完整 `repair-results/`。本次归档未调用模型，未执行全量回归；只保留上述真实 run 与独立 verify 证据。
+
 ## 0.3.0 未验证项
 
 - 未执行 Greenhouse，也未验证其兼容性。

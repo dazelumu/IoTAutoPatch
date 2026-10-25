@@ -44,23 +44,30 @@ DEFAULTS = {
                # mode deliberately ignores all firmware_* keys.
                "firmware_max_rounds": 3,
                "firmware_localize_queries": 16,
-               "firmware_relocalize_queries": 8,
+               "firmware_relocalize_queries": 16,
                "firmware_query_batch_size": 4,
                "firmware_no_progress_turns": 4,
                "firmware_decisive_site_inspections": 2,
                "firmware_decisive_site_discoveries": 2,
+               "firmware_pagination_queries": 8,
+                "firmware_runtime_sink_probe_limit": 3,
                "firmware_length_differential": False,
                "firmware_length_probe_limit": 8,
                "firmware_localize_timeout_seconds": 1800,
                "firmware_relocalize_timeout_seconds": 900,
                "firmware_repair_timeout_seconds": 600,
                "firmware_query_max_output_tokens": 32768,
+               "firmware_poc_reasoning_effort": "low",
+              "firmware_test_reasoning_effort": "low",
+              "firmware_repair_reasoning_effort": "low",
                "firmware_query_reasoning_effort": "low",
                "firmware_length_recovery_reasoning_effort": "low",
                "firmware_registration_max_output_tokens": 8192,
                "firmware_registration_reasoning_effort": "low",
                "firmware_conclusion_max_output_tokens": 24576,
                "firmware_repair_max_output_tokens": 32768,
+               # Compatibility-only: candidate functional verdicts now use
+               # firmware.poc_request_timeout, the same budget as reproduction.
                "firmware_exploratory_observation_seconds": 5},
     "validation": {"baseline_runs": 3, "poc_runs": 3, "poc_timeout_seconds": 15,
                    "test_timeout_seconds": 120, "generate_tests": True,
@@ -472,6 +479,21 @@ def validate_model_config(cfg: dict) -> None:
         raise RepairError(
             "preparation_failed",
             "Invalid repair.firmware_query_reasoning_effort")
+    poc_effort = cfg["repair"]["firmware_poc_reasoning_effort"]
+    if poc_effort not in firmware_reasoning_efforts:
+        raise RepairError(
+            "preparation_failed",
+            "Invalid repair.firmware_poc_reasoning_effort")
+    test_effort = cfg["repair"]["firmware_test_reasoning_effort"]
+    if test_effort not in firmware_reasoning_efforts:
+        raise RepairError(
+            "preparation_failed",
+            "Invalid repair.firmware_test_reasoning_effort")
+    repair_effort = cfg["repair"]["firmware_repair_reasoning_effort"]
+    if repair_effort not in firmware_reasoning_efforts:
+        raise RepairError(
+            "preparation_failed",
+            "Invalid repair.firmware_repair_reasoning_effort")
     registration_effort = cfg["repair"]["firmware_registration_reasoning_effort"]
     if registration_effort not in firmware_reasoning_efforts:
         raise RepairError(
@@ -506,6 +528,9 @@ def public_config(cfg: dict) -> dict:
             if isinstance(values, dict):
                 for key, value in values.items():
                     if isinstance(value, str):
-                        values[key] = value.replace(secret, "<redacted>")
+                        if value == secret:
+                            values[key] = "<redacted>"
+                        elif len(secret) >= 16:
+                            values[key] = value.replace(secret, "<redacted>")
     result["model"]["api_key"] = None
     return result

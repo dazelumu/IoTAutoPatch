@@ -10,14 +10,14 @@ Project Vuln Repair 的长期目标是做一个面向绝大多数 IoT 固件的�
 
 ### 已经有真实闭环证据的范围
 
-当前唯一完成真实端到端修复验证的案例是：
+当前已有两个完成真实端到端修复验证的案例，均来自同一固件与目标：
 
 - 设备/固件：D-Link DIR-825 B 2.03；
-- CVE：CVE-2025-6291；
+- CVE：CVE-2025-6291 与 CVE-2024-57595；
 - CPU/ABI：MIPS32 big-endian，o32；
 - 目标服务：`sbin/httpd`；
-- 访问协议：80 端口 HTTP ASCII GET/HEAD；
-- 漏洞类型：栈溢出类致命内存破坏，实际运行中表现为可归因的致命信号退出；
+- 访问协议：80 端口受限 ASCII HTTP；CVE-2025-6291 为 GET/HEAD 崩溃路线，CVE-2024-57595 为表单 POST + 多步认证 marker 路线；
+- 漏洞类型：CVE-2025-6291 为栈溢出类致命内存破坏，CVE-2024-57595 为 OS 命令注入；
 - 修复路线：FirmAE diagnostic-only analysis / intake，再由 `native-proot-mips32be` 权威重托管和验收；
 - 模型：智谱 GLM-5.3 的 OpenAI 兼容接口；
 - 结果：真实 run 曾达到 `validated_candidate`，独立 verify 曾达到 `verified_with_cleanup_warnings`。
@@ -26,7 +26,7 @@ Project Vuln Repair 的长期目标是做一个面向绝大多数 IoT 固件的�
 
 这证明的是路线 A 在 DIR-825 上可运行，不证明任意固件、任意 MIPS 固件或任意栈溢出漏洞已经可修复。
 
-案例索引中另有一个控制器复现已验证但修复未闭环的同固件案例：DIR-825 B 2.03 / CVE-2024-57595，目标是 `apc_client_pin.cgi` 的 OS 命令注入。隔离实验证明登录、8 字节表单注入和受控 marker 副作用；0.3.0 固定安装环境已通过 doctor 和声明式 marker reproduce。下一步是模型定位、候选修复和独立 verify，详见 [../cases/dlink/dir825b-2.03/cve-2024-57595/README.md](../cases/dlink/dir825b-2.03/cve-2024-57595/README.md)。
+CVE-2024-57595 案例已完成六步表单 PoC、真实模型定位、wrapper 修复、4/4 最终测试和独立 verify；清理警告仅涉及 root 持有的临时目录删除权限。详见 [../cases/dlink/dir825b-2.03/cve-2024-57595/README.md](../cases/dlink/dir825b-2.03/cve-2024-57595/README.md)。
 
 ### 已实现但仍需真实验证的扩展基础
 
@@ -46,8 +46,8 @@ Project Vuln Repair 的长期目标是做一个面向绝大多数 IoT 固件的�
 
 - 未验证 MIPS32 little-endian、ARM32、AArch64、x86 或其他架构；
 - 未验证 DIR-825 之外的品牌、机型和目标服务；
-- 已注册的受限 POST/auth/多步协议已通过 CVE-2024-57595 doctor/reproduce，尚未完成模型修复 run 和独立 verify；HTTPS、非 80 端口、multipart、任意 header/body 和私有协议仍未支持；
-- 未验证堆溢出、UAF、格式化字符串、整数溢出、命令注入等其他漏洞类型的完整修复闭环；
+- 已注册的受限 POST/auth/多步协议仅在 CVE-2024-57595 的声明式表单、认证和 marker 场景完成真实闭环；HTTPS、非 80 端口、multipart、任意 header/body 和私有协议仍未支持；
+- 未验证堆溢出、UAF、格式化字符串、整数溢出等其他漏洞类型的完整修复闭环；
 - 未验证 Greenhouse 真实执行；
 - 未验证控制器自建 QEMU runtime 的通用启动能力；
 - 未验证真实硬件；
@@ -77,7 +77,7 @@ Greenhouse 作为第二类外部诊断源，只提供 compatibility/rehost/repla
 
 | 阶段 | 目标 | 关键交付 | 明确不做的事 |
 |---|---|---|---|
-| P0：DIR-825 基线 | 保持当前唯一真实闭环稳定 | 0.3.0 文档/目录基线、路线 A 向导、证据边界 | 不把 DIR-825 经验夸大为通用支持 |
+| P0：DIR-825 基线 | 保持 GET/HEAD 崩溃与表单多步 marker 两条真实闭环稳定 | 0.3.0 文档/目录基线、路线 A 向导、证据边界 | 不把 DIR-825 经验夸大为通用支持 |
 | P1：输入与诊断泛化 | 让“固件包 + PoC”成为常规输入 | 固件格式识别、品牌/架构线索归一化、BootPlan 候选、FirmAE 报告兼容层、失败原因分类、诊断对照 | 不授权未验证 runtime 修复 |
 | P2：架构族扩展 | 从单一 MIPS32BE 扩展到常见 IoT 架构 | MIPS32LE、ARM32、AArch64 后端，ELF/ABI/调用序列/重定向/编译契约和测试 | 不支持没有交叉编译与回滚证明的架构 |
 | P3：runtime 泛化 | 降低单固件手工适配 | 参数化 native runtime、数据化 profile、控制器自建 QEMU 路线、启动资产生成、网络/存储隔离模板 | 不为了启动成功放弃身份绑定和事务回滚 |
@@ -105,7 +105,7 @@ Greenhouse 作为第二类外部诊断源，只提供 compatibility/rehost/repla
 1. **MIPS32LE 常见路由器固件：** 与当前 MIPS32BE 最接近，能先验证架构注册表和 ABI 差异处理；
 2. **ARM32 常见 IoT 固件：** 扩大设备覆盖面，检验调用约定、重定向和 runtime 模板泛化；
 3. **AArch64 新一代设备：** 验证 64 位 ABI、地址空间和编译契约；
-4. **HTTP POST/auth/多步管理面：** 以 DIR-825 B 2.03 / CVE-2024-57595 为首个案例，把已实现的受限表单 POST、认证会话、多步请求和命令注入 marker 验收推进到真实修复闭环；
+4. **HTTP POST/auth/多步管理面：** 巩固 DIR-825 B 2.03 / CVE-2024-57595 已完成的受限表单 POST、认证会话、多步请求、命令注入 marker 验收和 wrapper 修复闭环，再扩展到更多设备；
 5. **UPnP/私有 TCP 协议：** 再进入非纯 HTTP 服务；
 6. **堆破坏/UAF 等内存漏洞：** 在定位证据和语义验收更强后扩展；
 7. **Greenhouse 与路线 C runtime：** 与架构扩展并行推进，但不得提前授予权威。

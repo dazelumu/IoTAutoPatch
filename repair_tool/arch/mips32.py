@@ -27,11 +27,18 @@ from elftools.elf.relocation import RelocationSection
 OPCODE_LW = 0x23
 OPCODE_ORI = 0x0D
 OPCODE_LUI = 0x0F
+OPCODE_ADDIU = 0x09
+OPCODE_JAL = 0x03
 OPCODE_SPECIAL = 0x00
 FUNCT_JALR = 0x09
+FUNCT_JR = 0x08
+INSTRUCTION_JR_RA = 0x03E00008
 REG_GP = 28
 REG_T9 = 25
 NOP = 0x00000000
+MAX_LITERAL_PAIR_DISTANCE = 8
+DATA_TABLE_CONTEXT_RADIUS = 8
+MAX_SPLIT_CALL_DISTANCE = 16
 
 # [lw][nop][jalr][delay slot] -- 16 bytes replaced by [lui][ori][jalr][delay].
 CALL_SEQUENCE_SPAN = 16
@@ -54,6 +61,50 @@ def encode_lui(rt: int, imm: int) -> int:
 
 def encode_jalr(rs: int, rd: int = 31, shamt: int = 0) -> int:
     return (OPCODE_SPECIAL << 26) | (rs << 21) | (rd << 11) | (shamt << 6) | FUNCT_JALR
+
+
+def encode_jr(rs: int) -> int:
+    return (OPCODE_SPECIAL << 26) | (rs << 21) | FUNCT_JR
+
+
+def encode_sw(rt: int, base: int, offset: int) -> int:
+    return (0x2B << 26) | (base << 21) | (rt << 16) | (offset & 0xFFFF)
+
+
+def encode_lw(rt: int, base: int, offset: int) -> int:
+    return (OPCODE_LW << 26) | (base << 21) | (rt << 16) | (offset & 0xFFFF)
+
+
+def encode_bne(rs: int, rt: int, offset: int) -> int:
+    return (0x05 << 26) | (rs << 21) | (rt << 16) | (offset & 0xFFFF)
+
+
+def _is_lw_t9_from_gp(word: int) -> bool:
+    return ((word >> 26) == OPCODE_LW
+            and ((word >> 21) & 0x1F) == REG_GP
+            and ((word >> 16) & 0x1F) == REG_T9)
+
+
+def _is_jalr_t9(word: int) -> bool:
+    return (word >> 26) == OPCODE_SPECIAL and word == encode_jalr(REG_T9)
+
+
+def _writes_t9(word: int) -> bool:
+    """Conservative destination check for common MIPS I instruction forms."""
+    opcode = word >> 26
+    if opcode == OPCODE_LW:
+        return ((word >> 16) & 0x1F) == REG_T9
+    if opcode == OPCODE_LUI:
+        return ((word >> 16) & 0x1F) == REG_T9
+    if opcode in {OPCODE_ORI, OPCODE_ADDIU}:
+        return ((word >> 16) & 0x1F) == REG_T9
+    if opcode == OPCODE_SPECIAL:
+        funct = word & 0x3F
+        if funct in {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x2A}:  # add/sub/logic/slt
+            return ((word >> 11) & 0x1F) == REG_T9
+        if funct == FUNCT_JALR:
+            return ((word >> 11) & 0x1F) == REG_T9
+    return False
 
 
 def word_to_bytes(word: int) -> bytes:
@@ -186,6 +237,9 @@ class ElfAnalysis:
                             seen_symbols.add(identity)
                             self.symbol_records.append(record)
         self.symbol_records.sort(key=lambda item: (item["value"], item["name"]))
+        self._indirect_calls_cache: dict[str, list[dict]] = {}
+        self._function_starts_cache: list[int] | None = None
+        self._all_indirect_calls_cache: list[dict] | None = None
 
     def close(self):
         self.elf.stream.close()
@@ -351,7 +405,10 @@ class ElfAnalysis:
         if (lw >> 26) != OPCODE_LW \
                 or ((lw >> 21) & 0x1F) != REG_GP \
                 or ((lw >> 16) & 0x1F) != REG_T9:
-            raise ValueError("patch site does not start with lw $t9,off($gp)")
+            raise ValueError(
+                "patch site must be the initial lw $t9,off($gp) instruction "
+                "of the 16-byte sequence (use the function_calls entry vaddr; "
+                "do not submit the jalr or delay slot)")
         if gap != NOP:
             raise ValueError("patch site has no nop between lw and jalr")
         if jalr != encode_jalr(REG_T9):
@@ -368,27 +425,31 @@ class ElfAnalysis:
                 "callee": callee, "delay_slot_hex": word_to_bytes(delay).hex()}
 
     def indirect_calls(self, contains: str) -> list[dict]:
-        """Resolved canonical indirect calls matching model-provided text.
+        """Resolved indirect calls matching model-provided text.
 
         This is a neutral index, not a vulnerability candidate scan: callers
-        choose the text and receive every matching resolved callee in address
-        order. No built-in function names or ranking enter this path.
+        choose the text and receive matching resolved callees in address order.
+        Canonical 16-byte sites are redirectable; split load/call sequences are
+        evidence only and are explicitly marked non-redirectable.
         """
+        if self._all_indirect_calls_cache is None:
+            self._all_indirect_calls_cache = self._scan_indirect_calls()
+        return [site for site in self._all_indirect_calls_cache
+                if contains in site["callee"]]
+
+
+    def _scan_indirect_calls(self) -> list[dict]:
+        """Index canonical and conservative split PLT call sequences."""
         gp = self._gp_value()
         reloc_map = self._relocation_got_map()
         value_map = self._dynsym_by_value()
-        sites = []
+        sites: list[dict] = []
         for segment in self.executable_segments():
             start = segment["vaddr"]
-            end = start + segment["filesz"]
-            for vaddr in range(start, end - CALL_SEQUENCE_SPAN + 1, 4):
-                lw, gap, jalr, delay = struct.unpack(
-                    ">4I", self.bytes_at(vaddr, CALL_SEQUENCE_SPAN))
-                if (lw >> 26) != OPCODE_LW \
-                        or ((lw >> 21) & 0x1F) != REG_GP \
-                        or ((lw >> 16) & 0x1F) != REG_T9 \
-                        or gap != NOP \
-                        or jalr != encode_jalr(REG_T9):
+            end = segment["vaddr"] + segment["filesz"]
+            for vaddr in range(start, end - 4, 4):
+                lw = self.read_word(vaddr)
+                if not _is_lw_t9_from_gp(lw):
                     continue
                 got_vaddr = gp + _sign_extend16(lw & 0xFFFF)
                 callee = reloc_map.get(got_vaddr)
@@ -396,14 +457,52 @@ class ElfAnalysis:
                     slot_value = self.read_word(got_vaddr)
                     if slot_value is not None:
                         callee = value_map.get(slot_value)
-                if callee is None or contains not in callee:
+                if callee is None:
                     continue
-                sites.append({"vaddr": vaddr, "callee": callee,
-                              "got_vaddr": got_vaddr,
-                              "bytes_hex": self.bytes_at(
-                                  vaddr, CALL_SEQUENCE_SPAN).hex(),
-                              "delay_slot_hex": word_to_bytes(delay).hex()})
-        return sites
+                jalr_vaddr = None
+                for cursor in range(
+                        vaddr + 4,
+                        min(end, vaddr + 4 * (MAX_SPLIT_CALL_DISTANCE + 1)),
+                        4):
+                    word = self.read_word(cursor)
+                    if word == NOP:
+                        continue
+                    if _is_jalr_t9(word):
+                        jalr_vaddr = cursor
+                        break
+                    if _writes_t9(word):
+                        break
+                if jalr_vaddr is None:
+                    continue
+                gap_words = (jalr_vaddr - vaddr - 4) // 4
+                if gap_words == 1:
+                    original = self.bytes_at(vaddr, CALL_SEQUENCE_SPAN)
+                    lw2, gap, jalr, delay = struct.unpack(">4I", original)
+                    if _is_lw_t9_from_gp(lw2) and gap == NOP \
+                            and _is_jalr_t9(jalr):
+                        sites.append({
+                            "vaddr": vaddr, "callee": callee,
+                            "got_vaddr": got_vaddr,
+                            "bytes_hex": original.hex(),
+                            "delay_slot_hex": word_to_bytes(delay).hex(),
+                            "sequence": "canonical_16_byte",
+                            "redirectable": True,
+                        })
+                    continue
+                delay = self.read_word(jalr_vaddr + 4)
+                sites.append({
+                    "vaddr": vaddr, "callee": callee,
+                    "got_vaddr": got_vaddr,
+                    "bytes_hex": self.bytes_at(
+                        vaddr, jalr_vaddr + 8 - vaddr).hex(),
+                    "delay_slot_hex": (word_to_bytes(delay).hex()
+                                       if delay is not None else None),
+                    "sequence": "split_t9_jalr",
+                    "redirectable": False,
+                    "gap_instruction_count": gap_words,
+                    "jalr_vaddr": jalr_vaddr,
+                })
+        return sorted(sites, key=lambda item: item["vaddr"])
 
     def direct_callers(self, target: int) -> list[dict]:
         """Direct MIPS JAL sites targeting a model-provided address."""
@@ -425,6 +524,309 @@ class ElfAnalysis:
                         "bytes_hex": self.bytes_at(site, 8).hex(),
                     })
         return callers
+
+    def data_references(self, address: int) -> list[dict]:
+        """Find bounded static ways code can materialize an exact address.
+
+        Firmware commonly builds a virtual address with ``lui`` plus either
+        ``ori`` or ``addiu``.  Some firmware instead stores the address in a
+        pointer table.  Both are evidence references, not claims about how the
+        value is used.
+        """
+        if type(address) is not int or address <= 0 or address % 4:
+            raise ValueError("data reference target must be a positive "
+                             "4-byte-aligned address")
+        references: list[dict] = []
+        for segment in self.executable_segments():
+            start = segment["vaddr"]
+            end = start + segment["filesz"]
+            words = [(vaddr, word) for vaddr, word in self._iter_words(start, end)
+                     if (word >> 26) == OPCODE_LUI]
+            for lui_vaddr, lui_word in words:
+                register = (lui_word >> 16) & 0x1F
+                high = lui_word & 0xFFFF
+                cursor = lui_vaddr + 4
+                for distance in range(1, MAX_LITERAL_PAIR_DISTANCE + 1):
+                    low_word = self.read_word(cursor)
+                    if low_word is None:
+                        break
+                    low_opcode = low_word >> 26
+                    low_register = (low_word >> 16) & 0x1F
+                    low_base = (low_word >> 21) & 0x1F
+                    low_imm = low_word & 0xFFFF
+                    if (low_opcode in (OPCODE_ORI, OPCODE_ADDIU)
+                            and low_base == register
+                            and low_register == register):
+                        candidate = (high << 16) + (
+                            low_imm if low_opcode == OPCODE_ORI
+                            else _sign_extend16(low_imm))
+                        if candidate == address:
+                            references.append({
+                                "kind": "literal_pair",
+                                "vaddr": lui_vaddr,
+                                "materialization_vaddr": cursor,
+                                "register": register,
+                                "low_instruction": (
+                                    "ori" if low_opcode == OPCODE_ORI
+                                    else "addiu"),
+                                "distance_instructions": distance,
+                                "bytes_hex": self.bytes_at(lui_vaddr, 8).hex(),
+                            })
+                            break
+                    cursor += 4
+
+        needle = struct.pack(">I", address)
+        for segment in self.load_segments():
+            file_start = segment["offset"]
+            file_end = min(file_start + segment["filesz"], len(self.data))
+            cursor = file_start
+            while True:
+                found = self.data.find(needle, cursor, file_end)
+                if found < 0:
+                    break
+                if found % 4 == (segment["offset"] % 4):
+                    references.append({
+                        "kind": "word",
+                        "vaddr": segment["vaddr"] + found - segment["offset"],
+                        "segment_flags": segment["flags"],
+                        "bytes_hex": needle.hex(),
+                    })
+                cursor = found + 1
+        return sorted(references, key=lambda item: (
+            item["kind"], item["vaddr"]))
+
+    def data_table_context(self, address: int) -> dict:
+        """Decode a bounded word window around one file-backed address.
+
+        Firmware URL/form dispatch tables commonly mix data pointers and
+        executable function pointers.  This reports the neutral word layout;
+        it does not score entries or assign vulnerability semantics.
+        """
+        if type(address) is not int or address <= 0 or address % 4:
+            raise ValueError("data table context requires a positive "
+                             "4-byte-aligned address")
+        homes = [segment for segment in self.load_segments()
+                 if segment["vaddr"] <= address <
+                 segment["vaddr"] + segment["filesz"]]
+        if not homes:
+            raise ValueError("data table context address is not file-backed")
+        segment = homes[0]
+        segment_start = segment["vaddr"]
+        segment_end = segment["vaddr"] + segment["filesz"]
+        start = max(segment_start, address - DATA_TABLE_CONTEXT_RADIUS * 4)
+        end = min(segment_end, address + (DATA_TABLE_CONTEXT_RADIUS + 1) * 4)
+        executable = self.executable_segments()
+
+        def executable_home(value: int) -> dict | None:
+            return next((item for item in executable
+                         if item["vaddr"] <= value <
+                         item["vaddr"] + item["filesz"]), None)
+
+        words = []
+        for vaddr in range(start, end, 4):
+            value = self.read_word(vaddr)
+            if value is None:
+                continue
+            item = {"vaddr": vaddr, "value": value}
+            ascii_value = self._ascii_at(value)
+            if ascii_value is not None:
+                item["classification"] = "ascii_pointer"
+                item["ascii"] = ascii_value
+                words.append(item)
+                continue
+            execution_home = executable_home(value) \
+                if value % 4 == 0 and value > 0 else None
+            if execution_home is not None:
+                item["classification"] = "executable_pointer"
+                item["target_segment_flags"] = execution_home["flags"]
+                function = self.containing_function(value)
+                if function is not None:
+                    item["function"] = function
+                symbols = [record for record in self.symbol_records
+                           if record["type"] == "STT_FUNC"
+                           and record["value"] == value]
+                if symbols:
+                    item["symbol"] = symbols[0]["name"]
+            else:
+                if any(seg["vaddr"] <= value < seg["vaddr"] + seg["filesz"]
+                       for seg in self.load_segments()):
+                    item["classification"] = "data_pointer"
+                else:
+                    item["classification"] = "scalar"
+            words.append(item)
+        return {
+            "address": address,
+            "segment": {
+                "vaddr": segment["vaddr"],
+                "filesz": segment["filesz"],
+                "flags": segment["flags"],
+            },
+            "start": start,
+            "end": end,
+            "words": words,
+        }
+
+    def containing_function(self, address: int) -> dict | None:
+        """Return a bounded function interval containing an address.
+
+        FUNC symbols are preferred.  Stripped firmware gets a conservative
+        return-boundary estimate; the result explicitly marks that method so
+        downstream evidence cannot pretend symbols existed.
+        """
+        if type(address) is not int or address <= 0 or address % 4:
+            raise ValueError("function address must be a positive "
+                             "4-byte-aligned address")
+        homes = [record for record in self.symbol_records
+                 if record["type"] == "STT_FUNC"
+                 and (record["value"] == address
+                      or (record["size"] and record["value"] <= address
+                          < record["value"] + record["size"]))]
+        homes = [record for record in homes
+                 if record["size"] or self._next_symbol_address(record["value"])]
+        if homes:
+            record = max(homes, key=lambda item: item["value"])
+            start = record["value"]
+            end = (start + record["size"] if record["size"]
+                   else self._next_symbol_address(start) or start + 4)
+            return {"start": start, "end": max(end, address + 4),
+                    "name": record["name"], "method": "symbol"}
+
+        home = [segment for segment in self.executable_segments()
+                if segment["vaddr"] <= address <
+                segment["vaddr"] + segment["filesz"]]
+        if not home:
+            return None
+        segment = home[0]
+        segment_start = segment["vaddr"]
+        segment_end = segment["vaddr"] + segment["filesz"]
+        starts = [candidate for candidate in self._function_start_candidates()
+                  if segment_start <= candidate <= address]
+        start = max(starts, default=segment_start)
+        end = segment_end
+        later_starts = [candidate for candidate in self._function_start_candidates()
+                        if start < candidate < segment_end]
+        if later_starts:
+            end = min(end, min(later_starts))
+        for candidate in range(address, segment_end - 4, 4):
+            if self._is_return_end(candidate):
+                end = min(segment_end, candidate + 8)
+                break
+        return {"start": start, "end": max(end, address + 4),
+                "name": None,
+                "method": ("start_candidate_heuristic" if starts else
+                           "return_boundary_heuristic")}
+
+    def function_calls(self, address: int) -> list[dict]:
+        """List direct JAL and resolved indirect calls in a function."""
+        function = self.containing_function(address)
+        if function is None:
+            return []
+        start, end = function["start"], function["end"]
+        calls: list[dict] = []
+        value_names = self._dynsym_by_value()
+        for site in range(start, end - 4, 4):
+            word = self.read_word(site)
+            if word is None or word >> 26 != OPCODE_JAL:
+                continue
+            target = ((site + 4) & 0xF0000000) | ((word & 0x03FFFFFF) << 2)
+            calls.append({
+                "kind": "direct_jal", "vaddr": site, "target": target,
+                "callee": value_names.get(target), "bytes_hex":
+                    self.bytes_at(site, 8).hex(),
+            })
+        for site in self.indirect_calls(""):
+            if start <= site["vaddr"] < end:
+                item = dict(site)
+                item["kind"] = "indirect_jalr"
+                if item.get("redirectable") is False:
+                    item["patch_site_eligible"] = False
+                    item["reason"] = (
+                        "split lw/jalr sequence is call evidence only; "
+                        "the current 16-byte redirect encoder cannot replace it")
+                calls.append(item)
+        return sorted(calls, key=lambda item: item["vaddr"])
+
+    def _iter_words(self, start: int, end: int):
+        for vaddr in range(start, end - 3, 4):
+            word = self.read_word(vaddr)
+            if word is not None:
+                yield vaddr, word
+
+    def _ascii_at(self, address: int, *, maximum: int = 128) -> str | None:
+        if address <= 0:
+            return None
+        homes = [segment for segment in self.load_segments()
+                 if segment["vaddr"] <= address <
+                 segment["vaddr"] + segment["filesz"]]
+        if not homes:
+            return None
+        segment = homes[0]
+        available = min(
+            maximum,
+            segment["vaddr"] + segment["filesz"] - address,
+        )
+        if available <= 0:
+            return None
+        try:
+            raw = self.bytes_at(address, available)
+        except ValueError:
+            return None
+        end = raw.find(b"\x00")
+        if end < 0:
+            return None
+        value = raw[:end]
+        if len(value) < 4 or any(byte < 0x20 or byte > 0x7e
+                                 for byte in value):
+            return None
+        return value.decode("ascii")
+
+    def _is_return_end(self, vaddr: int) -> bool:
+        return (self.read_word(vaddr) == INSTRUCTION_JR_RA
+                and self.read_word(vaddr + 4) == NOP)
+
+    def _function_start_candidates(self) -> set[int]:
+        """Neutral function starts recoverable from static control/data flow."""
+        if self._function_starts_cache is not None:
+            return set(self._function_starts_cache)
+        starts: set[int] = {int(self.elf.header["e_entry"])}
+        starts.update(record["value"] for record in self.symbol_records
+                      if record["type"] == "STT_FUNC" and record["value"])
+        executable = self.executable_segments()
+
+        def is_executable_address(value: int) -> bool:
+            return value % 4 == 0 and any(
+                segment["vaddr"] <= value <
+                segment["vaddr"] + segment["filesz"]
+                for segment in executable)
+
+        for segment in executable:
+            for vaddr, word in self._iter_words(
+                    segment["vaddr"],
+                    segment["vaddr"] + segment["filesz"]):
+                if word >> 26 == OPCODE_JAL:
+                    target = ((vaddr + 4) & 0xF0000000) | (
+                        (word & 0x03FFFFFF) << 2)
+                    if is_executable_address(target):
+                        starts.add(target)
+        for segment in self.load_segments():
+            file_end = min(segment["offset"] + segment["filesz"],
+                           len(self.data))
+            for offset in range(segment["offset"], file_end - 3, 4):
+                value = struct.unpack_from(">I", self.data, offset)[0]
+                if is_executable_address(value):
+                    starts.add(value)
+        self._function_starts_cache = sorted(starts)
+        return set(self._function_starts_cache)
+
+    def _next_function_address(self, address: int) -> int | None:
+        values = [record["value"] for record in self.symbol_records
+                  if record["type"] == "STT_FUNC" and record["value"] > address]
+        return min(values) if values else None
+
+    def _next_symbol_address(self, address: int) -> int | None:
+        values = [record["value"] for record in self.symbol_records
+                  if record["value"] > address]
+        return min(values) if values else None
 
     # -- danger scan -------------------------------------------------------
     def call_sites(self, callee_names: tuple[str, ...] = ("strcat", "strcpy",

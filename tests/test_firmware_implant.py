@@ -269,6 +269,36 @@ def test_proposal_roundtrip(ledger):
                 "rationale": "bound the copy"}
     clean = validate_proposal(proposal, book)
     assert clean["edits"][0]["site"] == sites[0]["vaddr"]
+    assert clean["edits"][0]["mode"] == "leaf"
+
+
+def test_wrapper_proposal_roundtrip_and_invalid_mode(ledger):
+    book, sites = ledger
+    source = "int repair_entry(const char *s){return !s;}"
+    edit = make_edit(sites[0], source=source, mode="wrapper")
+    clean = validate_proposal({"edits": [edit]}, book)
+    assert clean["edits"][0]["mode"] == "wrapper"
+
+    edit = make_edit(sites[0], source=source, mode="trampoline")
+    with pytest.raises(RepairError, match="edit.mode"):
+        validate_proposal({"edits": [edit]}, book)
+
+
+def test_semantic_rejection_top_level_contract(ledger):
+    book, _ = ledger
+    proposal = {
+        "edits": [],
+        "rejection_reason": "This lookup site cannot preserve the valid request behavior.",
+        "retry_scope": "relocalize",
+    }
+    clean = validate_proposal(proposal, book)
+    assert clean["edits"] == []
+    assert clean["retry_scope"] == "relocalize"
+
+    proposal["edits"] = [make_edit(ledger[1][0])]
+    with pytest.raises(RepairError,
+                       match="Semantic rejection keys require an empty edits"):
+        validate_proposal(proposal, book)
 
 
 def test_model_code_site_authorizes_only_model_selected_site(runner, tmp_path):
@@ -329,6 +359,33 @@ def test_proposal_prompt_exposes_only_model_selected_site():
     assert "$a0" not in prompt
     assert "bounded copy" not in prompt.lower()
     assert "exactly one function named `repair_entry`" in prompt
+    assert "external effect" in prompt
+    assert "attacker-controlled fragment" in prompt
+    assert "Do not reject merely" in prompt
+    assert "metacharacter occurs anywhere" in prompt
+    assert "controller_required_edits" in prompt
+    assert "Do not use string literals" in prompt
+
+
+def test_proposal_prompt_accepts_marker_fault_without_single_request_path():
+    prompt = proposal_prompt({
+        "target_sha256": "a" * 64,
+        "model_code_sites": [{
+            "evidence": "e7", "site": 0x401000,
+            "bytes_hex": "11" * 16,
+        }],
+    }, {
+        "request": {"capture_fields": ["nonce"]},
+        "marker": {"guest_path": "/Q", "created": True, "empty": True},
+        "outcome": "command_injection_marker",
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+    }, rounds_left=1)
+
+    assert "outcome command_injection_marker" in prompt
+    assert "http-ascii-auth-form-multi-step-port80" in prompt
+    assert "confirmed marker is '/Q'" in prompt
+    assert "stable target identity and no fatal exit" in prompt
+    assert "Traceback" not in prompt
 
 
 @pytest.mark.parametrize("mutate,reason", [
@@ -463,6 +520,68 @@ def test_implant_redirect_changes_behavior(runner, ledger, tmp_path):
         f"patched runner rc={patched.returncode} (want 43), stderr: {patched.stderr[:200]}"
 
 
+def test_wrapper_implant_preserves_original_call(runner, ledger, tmp_path):
+    """Wrapper mode permits a call at a behavior-critical sink.
+
+    The decision function rejects NULL input (nonzero), which prevents the
+    original concat call. For the runner's non-NULL input it returns zero,
+    the controller trampoline reloads the original callee from the untouched
+    GOT entry, and the original side effect still happens.
+    """
+    if not _tool_ok():
+        pytest.skip("clang/qemu-mips not available")
+    book, sites = ledger
+    source = "int repair_entry(const char *src){return src == 0;}"
+    proposal = {"edits": [make_edit(sites[0], site_index=0,
+                                    source=source, mode="wrapper")]}
+    clean = validate_proposal(proposal, book)
+    built = build_candidate(runner, clean["edits"], tmp_path / "wrapper")
+    record = built["record"]
+    edit_record = record["edits"][0]
+    implant = record["implants"][0]
+    assert edit_record["mode"] == "wrapper"
+    assert edit_record["entry_vaddr"] == implant["entry_vaddr"]
+    assert implant["entry_vaddr"] > implant["vaddr"]
+    assert implant["original_callee_got_offset"] is not None
+    assert implant["original_callee_load_hex"]
+    assert implant["final_hex"]
+    assert implant["hex"] == implant["final_hex"]
+    assert implant["pre_original_callee_patch_hex"] != implant["final_hex"]
+    assert record["wrapper_original_callees"][0]["site"] == edit_record["site"]
+    # The runner argument is non-NULL, so the original unbounded copy must
+    # still run and preserve the historical fault signature.
+    patched = qemu_run(built["candidate"])
+    assert patched.returncode < 0, patched.stderr[:200]
+
+
+def test_wrapper_preserves_original_arguments_across_helper_call(
+        runner, ledger, tmp_path):
+    """The helper call must not corrupt the original callee's o32 arguments.
+
+    This source deliberately clears $a0/$a1 after computing its zero result.
+    Without controller-side save/restore both original copy sites receive
+    NULL and skip their side effect.  With the trampoline contract the two
+    original calls still run, preserving the historical crash signature.
+    """
+    if not _tool_ok():
+        pytest.skip("clang/qemu-mips not available")
+    book, sites = ledger
+    source = """
+int repair_entry(char *dst, const char *src) {
+    int result = (dst == 0);
+    __asm__ volatile("move $4, $0\\n\\tmove $5, $0");
+    return result;
+}
+"""
+    edits = [make_edit(site, site_index=index, source=source,
+                       mode="wrapper")
+             for index, site in enumerate(sites)]
+    clean = validate_proposal({"edits": edits}, book)
+    built = build_candidate(runner, clean["edits"], tmp_path / "wrapper-args")
+    patched = qemu_run(built["candidate"])
+    assert patched.returncode < 0, patched.stderr[:200]
+
+
 def test_multi_edit_implants_are_independent(runner, ledger, tmp_path):
     """The audit's core reproduction: two DIFFERENT repair functions must
     produce two distinct implants; each call site redirects to its own
@@ -534,9 +653,11 @@ def test_code_hex_injection_produces_real_candidate(runner, ledger, tmp_path):
     assert record["implants"] == [{
         "site": edit["site"],
         "vaddr": record["implants"][0]["vaddr"],
+        "entry_vaddr": record["implants"][0]["vaddr"],
         "size": 8,
         "hex": code,
         "rebased_jumps": 0,
+        "mode": "leaf",
     }]
     assert record["edits"][0]["implant_vaddr"] == record["implants"][0]["vaddr"]
     assert record["artifacts"][0]["code_sha256"]

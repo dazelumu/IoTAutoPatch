@@ -170,6 +170,7 @@ def parse_model_queries(data) -> list[dict] | None:
       {"query": {"op": "disassemble", "site": 4226688, "around": 16}}
       {"queries": [{"op": ...}, ...]}                       (batch)
       {"op": "elf_info"}                                   (bare query)
+      {"register_patch_site": {"address": "4226688"}}       (decision alias)
     The vocabulary-style nesting {"op": ..., "fields": {"site|function": v,
     "around": n}} is normalized into flat query keys. Returns None when the
     reply is not a query (e.g. it is an evidence citation)."""
@@ -192,6 +193,18 @@ def parse_model_queries(data) -> list[dict] | None:
             raise RepairError("model_output_invalid",
                               "query op must be a non-empty string")
         raw = [data]                 # bare query object
+    elif set(data) == {"register_patch_site"}:
+        decision = data["register_patch_site"]
+        if isinstance(decision, dict):
+            raw = [{"op": "register_patch_site", **decision}]
+        elif isinstance(decision, int) or (
+                isinstance(decision, str)
+                and re.fullmatch(r"(?:0x[0-9a-fA-F]+|[0-9]+)", decision)):
+            raw = [{"op": "register_patch_site", "address": decision}]
+        else:
+            raise RepairError(
+                "model_output_invalid",
+                "register_patch_site decision must contain one address")
     if not raw:
         return None
     clean = []
@@ -206,6 +219,11 @@ def parse_model_queries(data) -> list[dict] | None:
                     item.setdefault(key, value)
         if isinstance(item.get("site|function"), int):
             item.setdefault("site", item.pop("site|function"))
+        address = item.get("address")
+        if isinstance(address, str) and re.fullmatch(
+                r"(?:0x[0-9a-fA-F]+|[0-9]+)", address):
+            item["address"] = int(
+                address, 16 if address.startswith("0x") else 10)
         clean.append(item)
     return clean
 
@@ -283,13 +301,18 @@ class EvidenceSession:
             "authoritative": False,
         } if diagnostic_query else {})
         result_key = {"symbols": "symbols", "ascii_search": "matches",
-                      "indirect_calls": "calls", "callers": "callers"}.get(
+                      "indirect_calls": "calls", "callers": "callers",
+                      "data_references": "references",
+                      "data_table_context": "words",
+                      "function_calls": "calls"}.get(
                           answer.get("op"))
         pagination = {}
         if result_key is not None and isinstance(answer.get(result_key), list):
             pagination = {"pagination": {
                 "offset": answer.get("offset"), "total": answer.get("total"),
                 "returned_count": len(answer[result_key]),
+                "next_offset": answer.get("next_offset"),
+                "truncated": answer.get("truncated", False),
             }}
         evidence_id = self.ledger.add(evidence_kind, {
             "annotation": annotation,
@@ -388,6 +411,10 @@ class EvidenceSession:
                 "disassemble": self._disassemble,
                 "candidate_disassemble": self._candidate_disassemble,
                 "ascii_search": self._ascii_search,
+                "data_references": self._data_references,
+                "data_table_context": self._data_table_context,
+                "containing_function": self._containing_function,
+                "function_calls": self._function_calls,
                 "indirect_calls": self._indirect_calls,
                 "callers": self._callers,
                 "elf_bytes": self._elf_bytes,
@@ -806,10 +833,145 @@ class EvidenceSession:
                 item["vaddr_hex"] = _hex_address(item["vaddr"])
             if type(item.get("got_vaddr")) is int:
                 item["got_vaddr_hex"] = _hex_address(item["got_vaddr"])
+            if type(item.get("jalr_vaddr")) is int:
+                item["jalr_vaddr_hex"] = _hex_address(item["jalr_vaddr"])
             visible_matches.append(item)
         answer = {"op": "indirect_calls", "contains": contains,
                   "offset": offset, "total": len(matches),
                   "calls": visible_matches}
+        self._log(query, answer)
+        return answer
+
+    def _data_references(self, query: dict) -> dict:
+        if set(query) - {"op", "address", "site", "function",
+                         "offset", "limit"}:
+            raise RepairError(
+                "model_output_invalid",
+                "data_references accepts one address and optional "
+                "offset/limit")
+        target = self._address_from_query(query)
+        offset, limit = self._page(query)
+        references = self.analysis.data_references(target)
+        visible = []
+        for item in references[offset:offset + limit]:
+            entry = dict(item)
+            for key in ("vaddr", "materialization_vaddr"):
+                if type(entry.get(key)) is int:
+                    entry[f"{key}_hex"] = _hex_address(entry[key])
+            visible.append(entry)
+        answer = {"op": "data_references", "address": target,
+                  "address_hex": _hex_address(target),
+                  "offset": offset, "total": len(references),
+                  "references": visible}
+        self._log(query, answer)
+        return answer
+
+    def _containing_function(self, query: dict) -> dict:
+        if set(query) - {"op", "address", "site", "function"}:
+            raise RepairError(
+                "model_output_invalid",
+                "containing_function accepts exactly one address")
+        target = self._address_from_query(query)
+        try:
+            function = self.analysis.containing_function(target)
+        except ValueError as exc:
+            raise RepairError("model_output_invalid", str(exc)) from exc
+        if function is None:
+            answer = {"op": "containing_function", "address": target,
+                      "address_hex": _hex_address(target),
+                      "function": None, "found": False}
+        else:
+            answer = {"op": "containing_function", "address": target,
+                      "address_hex": _hex_address(target),
+                      "function": {
+                          **function,
+                          "start_hex": _hex_address(function["start"]),
+                          "end_hex": _hex_address(function["end"]),
+                      }, "found": True}
+        self._log(query, answer)
+        return answer
+
+    def _data_table_context(self, query: dict) -> dict:
+        if set(query) - {"op", "address", "site", "function"}:
+            raise RepairError(
+                "model_output_invalid",
+                "data_table_context accepts exactly one address")
+        target = self._address_from_query(query)
+        try:
+            context = self.analysis.data_table_context(target)
+        except ValueError as exc:
+            raise RepairError("model_output_invalid", str(exc)) from exc
+        answer = {
+            "op": "data_table_context",
+            "address": context["address"],
+            "address_hex": _hex_address(context["address"]),
+            "segment": {
+                **context["segment"],
+                "vaddr_hex": _hex_address(context["segment"]["vaddr"]),
+            },
+            "start": context["start"],
+            "start_hex": _hex_address(context["start"]),
+            "end": context["end"],
+            "end_hex": _hex_address(context["end"]),
+            "words": [],
+        }
+        for item in context["words"]:
+            entry = dict(item)
+            for key in ("vaddr", "value"):
+                if type(entry.get(key)) is int:
+                    entry[f"{key}_hex"] = _hex_address(entry[key])
+            function = entry.get("function")
+            if isinstance(function, dict):
+                entry["function"] = {
+                    **function,
+                    "start_hex": _hex_address(function["start"]),
+                    "end_hex": _hex_address(function["end"]),
+                }
+            answer["words"].append(entry)
+        self._log(query, answer)
+        return answer
+
+    def _function_calls(self, query: dict) -> dict:
+        if set(query) - {"op", "address", "site", "function",
+                         "contains", "offset", "limit"}:
+            raise RepairError(
+                "model_output_invalid",
+                "function_calls accepts one address, optional contains, "
+                "and offset/limit")
+        target = self._address_from_query(query)
+        contains = query.get("contains")
+        if contains is not None and not isinstance(contains, str):
+            raise RepairError("model_output_invalid",
+                              "function_calls contains must be text")
+        offset, limit = self._page(query)
+        try:
+            function = self.analysis.containing_function(target)
+            calls = self.analysis.function_calls(target)
+        except ValueError as exc:
+            raise RepairError("model_output_invalid", str(exc)) from exc
+        if contains is not None:
+            calls = [item for item in calls
+                     if contains.lower() in str(item.get("callee", "")).lower()]
+        visible = []
+        for item in calls[offset:offset + limit]:
+            entry = dict(item)
+            for key in ("vaddr", "target", "got_vaddr"):
+                if type(entry.get(key)) is int:
+                    entry[f"{key}_hex"] = _hex_address(entry[key])
+            if type(entry.get("jalr_vaddr")) is int:
+                entry["jalr_vaddr_hex"] = _hex_address(entry["jalr_vaddr"])
+            visible.append(entry)
+        next_offset = offset + len(visible)
+        answer = {"op": "function_calls", "address": target,
+                  "address_hex": _hex_address(target),
+                  "function": function,
+                  "contains": contains,
+                  "offset": offset,
+                  "total": len(calls), "returned": len(visible),
+                  "calls": visible}
+        if visible and next_offset < len(calls):
+            answer["next_offset"] = next_offset
+            answer["truncated"] = True
         self._log(query, answer)
         return answer
 
@@ -913,9 +1075,25 @@ class EvidenceSession:
              "meaning": "decoded MIPS instructions and original bytes around an address"},
             {"op": "ascii_search", "fields": ["text", "offset>=0", "limit<=100"],
              "meaning": "addresses of exact model-provided ASCII text"},
+            {"op": "data_references",
+             "fields": ["address", "offset>=0", "limit<=100"],
+             "meaning": ("instruction or pointer-table references that "
+                         "materialize one model-provided data address")},
+            {"op": "data_table_context", "fields": ["address"],
+             "meaning": ("bounded word window around one data address, with "
+                         "neutral scalar/data/ASCII/executable pointer "
+                         "classification")},
+            {"op": "containing_function", "fields": ["address"],
+             "meaning": ("symbol or bounded heuristic function interval "
+                         "containing one address")},
+            {"op": "function_calls",
+             "fields": ["address", "contains?", "offset>=0", "limit<=100"],
+             "meaning": ("paged direct and resolved indirect calls in the "
+                         "function containing one address")},
             {"op": "indirect_calls",
              "fields": ["contains", "offset>=0", "limit<=100"],
-             "meaning": "resolved canonical indirect calls whose callee name contains model-provided text"},
+             "meaning": ("resolved indirect calls; canonical entries are "
+                         "redirectable and split sequences are evidence only")},
             {"op": "callers",
              "fields": ["address", "offset>=0", "limit<=100"],
              "meaning": "direct MIPS JAL sites targeting a model-provided address"},
@@ -988,13 +1166,17 @@ class EvidenceSession:
                         if kept else None,
                         "removed_instruction_count": len(instructions) - len(kept),
                         "truncated": True}
-        if op in {"symbols", "ascii_search", "indirect_calls", "callers"}:
+        if op in {"symbols", "ascii_search", "indirect_calls", "callers",
+                  "data_references", "data_table_context", "function_calls"}:
             compact = {key: answer[key] for key in
                        ("op", "contains", "text", "address", "offset", "total")
                        if key in answer}
             result_key = {"symbols": "symbols", "ascii_search": "matches",
-                          "indirect_calls": "calls",
-                          "callers": "callers"}[op]
+                      "indirect_calls": "calls",
+                      "callers": "callers",
+                      "data_references": "references",
+                      "data_table_context": "words",
+                      "function_calls": "calls"}[op]
             items = answer.get(result_key)
             if isinstance(items, list):
                 kept = []
@@ -1063,6 +1245,8 @@ class EvidenceSession:
         """
         clean = []
         allowed = {"elf_info", "elf_bytes", "symbols", "disassemble", "ascii_search",
+                   "data_references", "data_table_context",
+                   "containing_function", "function_calls",
                    "indirect_calls", "callers",
                    "candidate_elf_info", "candidate_disassemble",
                    "candidate_elf_bytes", "register_patch_site",

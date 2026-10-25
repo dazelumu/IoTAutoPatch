@@ -75,11 +75,11 @@ def _load_model_json(content: str):
     if fence and fence.group(1).strip():
         text = fence.group(1).strip()
         try:
-            return json.loads(text)
+            return _load_json_text(text)
         except json.JSONDecodeError:
             pass                    # fall through to balanced extraction
     try:
-        return json.loads(text)
+        return _load_json_text(text)
     except json.JSONDecodeError:
         pass
     # Balanced extraction: first '{' whose matching '}' closes a complete
@@ -114,6 +114,15 @@ def _load_model_json(content: str):
                 pass                # try the next '{'
         start = text.find("{", start + 1)
     raise json.JSONDecodeError("Expecting value", text, 0)
+
+
+def _load_json_text(text: str):
+    value = json.loads(text)
+    # Some models return the required object as a JSON string. Accept one
+    # unwrapping layer only; the resulting value must still be valid JSON.
+    if isinstance(value, str):
+        value = json.loads(value)
+    return value
 
 
 class ModelClient:

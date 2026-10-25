@@ -82,6 +82,24 @@ class EvidenceLedger:
             "session_id": session_id, "semantic_class": semantic_class,
         })
 
+    def defer_code_site(self, evidence_id: str, *, session_id: str,
+                        semantic_class: str, missing: list[str]) -> str:
+        """Record incomplete nomination evidence without rejecting the site."""
+        entry = self.get(evidence_id)
+        if entry is None or entry.get("kind") != "model_code_site":
+            raise ValueError("A nomination decision requires code-site evidence")
+        return self.add("nomination_decision", {
+            "evidence": evidence_id, "decision": "deferred",
+            "session_id": session_id, "semantic_class": semantic_class,
+            "missing_evidence": list(missing),
+        })
+
+    def nomination_decision(self, evidence_id: str) -> dict | None:
+        """Return the latest explicit nomination decision, if any."""
+        return next((event for event in reversed(self.by_kind(
+            "nomination_decision")) if event.get("evidence") == evidence_id),
+            None)
+
 
 def register_model_code_site(ledger: EvidenceLedger, analysis: ElfAnalysis,
                              site: int) -> str:

@@ -19,7 +19,9 @@ from repair_tool.firmware.http import parse_response, response_complete
 from repair_tool.firmware.rehost import FIRMWARE_DEADLINE_MESSAGE
 from repair_tool.firmware.tests import _observe_exits, delivery_complete
 from repair_tool.firmware.tests import run_one_test
-from repair_tool.firmware.verify import replay_plan, run_fixed_checks
+from repair_tool.firmware.tests import validate_tests
+from repair_tool.firmware.verify import (
+    replay_plan, run_fixed_checks, verify_candidate)
 
 
 HTTP_OK = b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nhome"
@@ -175,6 +177,352 @@ def test_fixed_check_crash_stays_functional_and_stops(tmp_path):
         encoding="utf-8"))
     assert len(saved) == 1
     assert saved[0]["exits"]
+
+
+def test_candidate_verification_isolates_phases_with_same_bytes(
+        tmp_path, monkeypatch):
+    class PhaseControl(ObservationControl):
+        def __init__(self):
+            super().__init__()
+            self.restarts = 0
+
+        def restart(self, transaction=None):
+            self.restarts += 1
+            self.target["pid"] += 1
+            return {"target": dict(self.target)}
+
+    control = PhaseControl()
+    order = []
+
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.run_fixed_checks",
+        lambda *_args, **_kwargs: order.append("fixed") or {"passed": True})
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.replay_plan",
+        lambda *_args, **_kwargs: order.append("replay") or
+        {"stable_identity": True})
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.run_tests",
+        lambda *_args, **_kwargs: order.append("tests") or [{"id": "t",
+                                                              "passed": True}])
+
+    result = verify_candidate(
+        control,
+        checks=[{"request": {"path": "/"}, "statuses": [200]}],
+        plan={"requests": [{"id": "trigger", "path": "/trigger"}]},
+        tests=[{"id": "t"}], logs=tmp_path, exit_timeout=0,
+        transaction="tx-isolate")
+
+    assert order == ["fixed", "replay", "tests"]
+    assert control.restarts == 2
+    assert [item["before"]["pid"] for item in result["phase_restarts"]] == [41, 42]
+    assert [item["after"]["pid"] for item in result["phase_restarts"]] == [42, 43]
+    assert all(item["same_sha256"] for item in result["phase_restarts"])
+    saved = json.loads((tmp_path / "phase-restarts.json").read_text(
+        encoding="utf-8"))
+    assert [item["phase"] for item in saved] == [
+        "fixed-to-replay", "replay-to-tests"]
+
+
+def test_phase_restart_evidence_persists_when_replay_fails(
+        tmp_path, monkeypatch):
+    class PhaseControl(ObservationControl):
+        def restart(self, transaction=None):
+            self.target["pid"] += 1
+            return {"target": dict(self.target)}
+
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.run_fixed_checks",
+        lambda *_args, **_kwargs: {"passed": True})
+
+    def replay_plan(*_args, **_kwargs):
+        raise RepairError("verification_failed", "home: incomplete_response")
+
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.replay_plan", replay_plan)
+
+    with pytest.raises(RepairError, match="home: incomplete_response"):
+        verify_candidate(
+            PhaseControl(), checks=[], plan={"requests": []}, tests=[],
+            logs=tmp_path, exit_timeout=0)
+
+    saved = json.loads((tmp_path / "phase-restarts.json").read_text(
+        encoding="utf-8"))
+    assert len(saved) == 1
+    assert saved[0]["phase"] == "fixed-to-replay"
+    assert saved[0]["before"]["pid"] == 41
+    assert saved[0]["after"]["pid"] == 42
+    assert saved[0]["same_sha256"] is True
+
+
+def test_candidate_phase_restart_rejects_changed_bytes(
+        tmp_path, monkeypatch):
+    class SwappedAfterRestartControl(ObservationControl):
+        def restart(self, transaction=None):
+            self.target["sha256"] = "c" * 64
+            return {"target": dict(self.target)}
+
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.run_fixed_checks",
+        lambda *_args, **_kwargs: {"passed": True})
+    replay_called = False
+
+    def replay_plan(*_args, **_kwargs):
+        nonlocal replay_called
+        replay_called = True
+        return {"stable_identity": True}
+
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.replay_plan", replay_plan)
+
+    with pytest.raises(RepairError, match="fixed-to-replay restart"):
+        verify_candidate(
+            SwappedAfterRestartControl(),
+            checks=[], plan={"requests": []}, tests=[], logs=tmp_path,
+            exit_timeout=0)
+
+    assert replay_called is False
+
+
+def test_marker_pre_trigger_incomplete_is_not_same_fault(tmp_path,
+                                                         monkeypatch):
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/"},
+            {"id": "trigger", "method": "POST", "path": "/trigger",
+             "expect": "marker_created", "form": {"q": "x"}},
+        ],
+    }
+
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.execute_steps",
+        lambda *_args, **_kwargs: {
+            "passed": False,
+            "stable_identity": True,
+            "results": [
+                {"id": "home", "expect": "response", "status": "failed",
+                 "reason": "incomplete_response"},
+            ],
+        })
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.marker_scenario_passed",
+        lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RepairError) as caught:
+        replay_plan(ObservationControl(), plan, tmp_path / "marker-replay")
+
+    assert caught.value.status == "verification_failed"
+    assert caught.value.verification_class == "pre_trigger_transport_failure"
+
+
+def test_marker_trigger_failure_is_not_pre_trigger(tmp_path, monkeypatch):
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/"},
+            {"id": "trigger", "method": "POST", "path": "/trigger",
+             "expect": "marker_created", "form": {"q": "x"}},
+        ],
+    }
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.execute_steps",
+        lambda *_args, **_kwargs: {
+            "passed": False,
+            "stable_identity": True,
+            "results": [
+                {"id": "home", "expect": "response", "status": "ok"},
+                {"id": "trigger", "expect": "marker_created",
+                 "status": "failed", "reason": "incomplete_response"},
+            ],
+        })
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.marker_scenario_passed",
+        lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RepairError) as caught:
+        replay_plan(ObservationControl(), plan,
+                    tmp_path / "trigger-classification")
+
+    assert caught.value.status == "verification_failed"
+    assert caught.value.verification_class == "trigger_transport_failure"
+
+
+def test_transient_marker_transport_failure_gets_one_candidate_retry(
+        tmp_path, monkeypatch):
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/"},
+            {"id": "trigger", "method": "POST", "path": "/trigger",
+             "expect": "marker_created", "form": {"q": "x"}},
+        ],
+    }
+    control = ObservationControl()
+    outcomes = [
+        {"passed": False, "stable_identity": True, "results": [
+            {"id": "home", "status": "failed",
+             "reason": "incomplete_response"},
+        ]},
+        {"passed": True, "stable_identity": True, "results": [
+            {"id": "home", "status": "ok"},
+            {"id": "trigger", "status": "ok", "marker_after": {
+                "exists": False}},
+        ]},
+    ]
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.execute_steps",
+        lambda *_args, **_kwargs: outcomes.pop(0))
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.marker_scenario_passed",
+        lambda execution, **_kwargs: execution["passed"])
+
+    replay = replay_plan(control, plan, tmp_path / "transient-retry")
+
+    assert replay["transport_retry"]["attempted"] is True
+    assert replay["transport_retry"]["restart"]["same_sha256"] is True
+    restarts = json.loads(
+        (tmp_path / "transient-retry" / "phase-restarts.json").read_text())
+    assert restarts[0]["phase"] == "replay-transport-retry"
+
+
+def test_transport_retry_failure_class_uses_first_observed_failure(
+        tmp_path, monkeypatch):
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/"},
+            {"id": "trigger", "method": "POST", "path": "/trigger",
+             "expect": "marker_created", "form": {"q": "x"}},
+        ],
+    }
+    outcomes = [
+        {"passed": False, "stable_identity": True, "results": [
+            {"id": "home", "status": "failed",
+             "reason": "incomplete_response"},
+        ]},
+        {"passed": False, "stable_identity": True, "results": [
+            {"id": "home", "status": "ok"},
+            {"id": "trigger", "status": "failed",
+             "reason": "incomplete_response"},
+        ]},
+    ]
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.execute_steps",
+        lambda *_args, **_kwargs: outcomes.pop(0))
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.marker_scenario_passed",
+        lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RepairError) as caught:
+        replay_plan(ObservationControl(), plan,
+                    tmp_path / "retry-first-failure")
+
+    assert caught.value.verification_class == "pre_trigger_transport_failure"
+
+
+def test_persistent_marker_transport_failure_retries_only_once(
+        tmp_path, monkeypatch):
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "home", "method": "GET", "path": "/"},
+            {"id": "trigger", "method": "POST", "path": "/trigger",
+             "expect": "marker_created", "form": {"q": "x"}},
+        ],
+    }
+    control = ObservationControl()
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.execute_steps",
+        lambda *_args, **_kwargs: {
+            "passed": False, "stable_identity": True, "results": [
+                {"id": "home", "status": "failed",
+                 "reason": "incomplete_response"},
+            ],
+        })
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.marker_scenario_passed",
+        lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RepairError) as caught:
+        replay_plan(control, plan, tmp_path / "persistent-retry")
+
+    assert caught.value.verification_class == "pre_trigger_transport_failure"
+    saved = json.loads(
+        (tmp_path / "persistent-retry" / "replay.json").read_text())
+    assert saved["transport_retry"]["attempted"] is True
+    assert control.target["pid"] == 42
+
+
+def test_marker_still_created_is_not_transport_retried(
+        tmp_path, monkeypatch):
+    plan = {
+        "protocol": "http-ascii-auth-form-multi-step-port80",
+        "outcome": "command_injection_marker",
+        "marker": "/Q",
+        "requests": [
+            {"id": "trigger", "method": "POST", "path": "/trigger",
+             "expect": "marker_created", "form": {"q": "x"}},
+        ],
+    }
+    control = ObservationControl()
+    control.restart = lambda transaction=None: pytest.fail(
+        "marker still created is decisive and must not restart/retry")
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.execute_steps",
+        lambda *_args, **_kwargs: {
+            "passed": False, "stable_identity": True, "results": [
+                {"id": "trigger", "status": "failed",
+                 "reason": "unexpected_marker"},
+            ],
+        })
+    monkeypatch.setattr(
+        "repair_tool.firmware.verify.marker_scenario_passed",
+        lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RepairError) as caught:
+        replay_plan(control, plan, tmp_path / "marker-still-created")
+
+    assert caught.value.verification_class == "marker_still_created"
+
+
+def test_framed_multi_step_path_cannot_be_collapsed_to_one_request():
+    required = [{
+        "steps": [{
+            "id": "lan", "method": "GET", "path": "/lan.asp",
+            "statuses": [200], "contains": "admin", "accept_timeout": True,
+        }],
+    }]
+    data = {
+        "tests": [
+            {"id": "collapsed", "kind": "independent", "expect": "pass",
+             "basis": "standalone LAN page", "request": {
+                 "method": "GET", "path": "/lan.asp"},
+             "response": {"statuses": [200]}},
+            {"id": "trigger", "kind": "vulnerability", "expect": "marker",
+             "basis": "confirmed trigger", "marker": "/Q", "steps": [{
+                 "id": "lan", "method": "GET", "path": "/lan.asp",
+                 "statuses": [200], "contains": "admin",
+                 "accept_timeout": True, "expect": "marker_created"}],
+             "protocol": "http-ascii-auth-form-multi-step-port80"},
+            {"id": "home", "kind": "regression", "expect": "pass",
+             "basis": "home page", "request": {"method": "GET", "path": "/"},
+             "response": {"statuses": [200]}},
+        ]
+    }
+
+    with pytest.raises(RepairError, match="complete step scenario"):
+        validate_tests(data, required_trigger_scenarios=required)
 
 
 def test_replay_crash_does_not_rewrite_firmware_deadline(tmp_path):

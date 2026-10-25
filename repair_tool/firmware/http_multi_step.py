@@ -127,6 +127,10 @@ def validate_steps(steps: object, *, protocol: str) -> list[dict]:
     for step in steps:
         if not isinstance(step, dict) or set(step) - allowed:
             raise RepairError("preparation_failed", "Invalid multi-step fields")
+        if not isinstance(step.get("path"), str) or not step["path"].startswith("/"):
+            raise RepairError(
+                "preparation_failed",
+                "Each multi-step request requires an explicit absolute path")
         ident = _field_name(step.get("id"), "Step id").replace("-", "_")
         if not ident.isidentifier() or ident in ids:
             raise RepairError("preparation_failed", "Step ids must be unique identifiers")

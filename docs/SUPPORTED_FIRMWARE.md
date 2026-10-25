@@ -15,11 +15,12 @@
 
 ## 当前已验证矩阵
 
-当前已验证 **1** 个固件/CVE 组合。
+当前已验证 **2** 个固件/CVE 组合。
 
 | CVE | 设备与固件 | 目标 | 架构 | 协议 | 漏洞类型 | 修复路线 | 真实 run | run 结果 | 独立验证 |
 |---|---|---|---|---|---|---|---|---|---|
 | CVE-2025-6291 | D-Link DIR-825 Rev. B 2.03 NA | `sbin/httpd` | MIPS32 big-endian / o32 | 80 端口 ASCII HTTP GET/HEAD | `do_file` 请求路径栈溢出 | FirmAE analysis/intake + `native-proot-mips32be` | `20261021-024629-b18f2722` | `validated_candidate` | `verified_with_cleanup_warnings` |
+| CVE-2024-57595 | D-Link DIR-825 Rev. B 2.03 NA | `sbin/httpd` | MIPS32 big-endian / o32 | 80 端口受限 ASCII GET/POST 表单与多步认证 | `apc_client_pin.cgi` `wps_pin` 命令注入 | FirmAE analysis/intake + `native-proot-mips32be` | `20261023-015556-7ca0e8ea` | `validated_candidate` | `verified_with_cleanup_warnings` |
 
 ## CVE-2025-6291 证据摘要
 
@@ -32,13 +33,23 @@
 - 独立验证：`verified_with_cleanup_warnings`；警告仅为 root 持有的临时 `host-rootfs` 目录无法由非 root 控制器删除，不否定候选验证。
 - 详细部署、全量回归和报告路径见 [../VALIDATION.md](../VALIDATION.md)。
 
+## CVE-2024-57595 证据摘要
+
+- 原始固件与目标 `sbin/httpd` SHA256 与 CVE-2025-6291 案例一致，均来自 DIR-825 Rev. B 2.03 NA 官方 ZIP。
+- 受控 PoC 是六步声明式流程：首页字段捕获、登录、认证页确认、合法 PIN `12345670`、8 字节注入 PIN `';>/Q ;#`、触发后再提交合法 PIN。基线证据以 `/Q` marker 差异、请求字节 SHA、目标身份和目标存活绑定。
+- 模型定位到 `apc_client_pin.cgi` handler 的 `_system` 调用点 `4272620`（`0x004131ec`）；runtime sink differential probe 显示阻断该调用后 marker 消失并成功回滚 baseline。
+- 候选使用 wrapper 语义：命令含 shell 控制元字符时不调用原 `_system`；合法命令返回 0 并由控制器生成 trampoline 重新调用原函数，保留合法 PIN 保存功能。
+- 0.3.0 真实 run：`20261023-015556-7ca0e8ea`，耗时 1702.185 秒，基线固定检查 1/1，最终生成测试 4/4。
+- 修复候选 `sbin/httpd` SHA256：`9045157760a96ef8b8a046b3f1d90356960e5ec05b86fda62fc445276c5798bf`；模型源码 SHA256：`f95f9a690791818580ac55feed80f2bc2c6f325e57149622045a74cefc2976aa`。
+- 独立验证：`verified_with_cleanup_warnings`；警告仅为 root 持有的临时 `host-rootfs` 目录无法由非 root 控制器删除，不否定回滚、重部署和候选验证。
+- 团队案例卡、PoC、补丁工件和脱敏报告见 [../cases/dlink/dir825b-2.03/cve-2024-57595/README.md](../cases/dlink/dir825b-2.03/cve-2024-57595/README.md)。
+
 ## 边界与解释限制
 
 - 公开 CVE 描述或第三方资料可能提到 HTTP POST；本项目实测和当前注册协议能力针对该 2.03NA 样本中的无鉴权 `.gif` GET 分支完成复现与修复验证。
 - 本清单证明的是受控 PRoot/QEMU 环境中的漏洞复现与修复，不证明物理 DIR-825 硬件、官方固件升级流程或完整官方 CVE 利用面已经验证。
-- 当前源码已注册受限表单 POST、Cookie 和多步 HTTP 协议，并已在 CVE-2024-57595 上完成真实 doctor 和 marker reproduce；但该协议还没有真实 `validated_candidate` 和独立 verify 证据，本清单中的 CVE-2025-6291 仍只能按 GET/HEAD 场景解释。
-- 同固件 CVE-2024-57595 已完成受控 PoC 方法验证和控制器 marker reproduce，尚未完成模型修复 run 与独立 verify 闭环，因此不进入本清单。
-- CVE-2025-6291 之外没有任何已验证固件/CVE 组合。ARM、AArch64、MIPS32LE、其他品牌、其他目标服务和 Greenhouse 权威路线仍未验证。
+- 受限表单 POST 和多步 HTTP 协议仅在 CVE-2024-57595 的已声明认证流程、表单字段和 marker 场景中验证，不能推广为任意 HTTP 或 Web 漏洞支持。
+- ARM、AArch64、MIPS32LE、其他品牌、其他目标服务和 Greenhouse 权威路线仍未验证。
 
 ## 外部参考
 

@@ -37,6 +37,7 @@ repair-results/
 /tmp/
 /experiments/
 /firmware-dataset/
+/firmware-dataset.old-firmware-route-20261021/
 
 # Case documentation is shareable; local case inputs and generated evidence are not.
 /cases/**
@@ -45,8 +46,10 @@ repair-results/
 !/cases/**/README.md
 !/cases/**/poc/*.py
 !/cases/**/patches/*.c
+!/cases/**/patches/*.json
 !/cases/**/config/*.example.yaml
 !/cases/**/results/*.json
+!/cases/**/results/**/*.json
 /cases/**/archive/**
 /project-vuln-repair-*.zip
 /project-vuln-repair-*.zip.sha256
