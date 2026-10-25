@@ -1,10 +1,10 @@
-# 0.3.0 验证状态
+# 0.3.0 / 0.3.1 验证状态
 
 日期：2026-10-21（Asia/Shanghai）
 
 ## 当前范围
 
-0.3.0 是当前固件管线的版本、文档、打包和源码树基线。本页记录 0.3.0 已执行的检查、真实修复成功 run，以及 CVE-2024-57595 控制器 marker reproduce 结果。
+0.3.0 是固件管线的文档与源码树基线；0.3.1 在其上完成 CVE-2024-57595 wrapper 修复闭环并归档团队案例。本页记录两个版本的检查、真实修复成功 run 与独立验证结果。
 
 当前已完成真实端到端修复的固件/CVE 组合见 [docs/SUPPORTED_FIRMWARE.md](docs/SUPPORTED_FIRMWARE.md)。
 
@@ -422,6 +422,44 @@
 团队归档目录为 `cases/dlink/dir825b-2.03/cve-2024-57595/`，已保留声明式 PoC、输入模板、模型 proposal、`repair.c`、`repair.o`、实际 patched candidate、patch record、run 报告、生成测试、定位与差分探测结果、独立验证证据和团队摘要。已校验 candidate SHA256 为 `9045157760a96ef8b8a046b3f1d90356960e5ec05b86fda62fc445276c5798bf`，源码与对象 SHA256 分别为 `f95f9a690791818580ac55feed80f2bc2c6f325e57149622045a74cefc2976aa`、`094d18d81fc030d918ebb89b23f5e43f61a540ae739fd598e56b0d4b1d5543e6`。
 
 归档整理已完成个人路径、挂载路径和 API key 扫描，未发现泄漏；未保存原始固件、rootfs、完整模型响应或完整 `repair-results/`。本次归档未调用模型，未执行全量回归；只保留上述真实 run 与独立 verify 证据。
+
+## 0.3.1 专业项目文档重构
+
+2026-10-25 参考 uv、pytest 与 Binwalk 等开源项目的文档分工，重构 0.3.1 文档但不改变程序行为：
+
+- 新增 `docs/README.md` 文档地图、推荐阅读顺序和写作规则；
+- 新增 `docs/CONTRIBUTING.md`，覆盖开发环境、定向测试策略、代码分层、提交前检查、PR 描述和案例/文档贡献；
+- 新增 `docs/SECURITY.md`，覆盖安全报告流程、信任边界、运行时隔离、FirmAE wrapper、模型数据外发和关键不变量；
+- 重写顶层 README：保留入口定位、当前能力、系统要求、Ubuntu 快速开始、最小工作流、命令参考、文档索引、仓库布局和验证状态；
+- 重写 `docs/OPERATIONS.md`：按安装、配置、路线 A、wrapper、结果解释、更新、打包、隐私和故障处理组织；
+- 修正 `docs/ARCHITECTURE.md` 末尾旧结论，明确当前真实闭环为同一 DIR-825 样本上的 CVE-2025-6291 与 CVE-2024-57595。
+
+定向验证：
+
+- Windows 本机：`PYTHONPATH=.test-python;.linux-python` 下执行 `python -m pytest tests/test_packaging.py tests/test_package_contents.py tests/test_config_validation.py -q --basetemp=tmp/pytest-docs-rewrite` — **16 passed, 1 skipped**；跳过原因是 Windows 缺少 POSIX `fcntl`，与既有测试说明一致。
+- `python -m py_compile scripts/package.py` — 通过。
+- `python scripts/package.py` 与 `python scripts/package.py --check` — 生成并校验 **141 个文件**的 0.3.1 包；发布包 SHA256 以 `dist/project-vuln-repair-0.3.1.zip.sha256` 的当前值为准。
+- 对 README/docs/cases 的 Markdown 文本扫描个人路径、挂载路径和用户名，未发现泄漏；`REPAIR_API_KEY` 仅作为环境变量示例出现。
+
+本节仅为文档与发布包检查。未修改程序代码，未部署 WSL，未执行部署后全量回归，未调用模型，也未产生新的固件修复结论。
+
+## 0.3.1 产品定位收敛补充
+
+2026-10-25 按项目决策将当前产品定位收敛为 **IoT 固件大模型自动漏洞修复系统**：
+
+- README、架构说明、操作手册、贡献指南、安全策略和变更记录不再把历史源码项目修复路线作为当前能力或使用方式介绍；
+- 顶层流程、系统要求、配置示例和代码组织说明改为固件路线优先；
+- 0.0.x–0.1.x 仅作为控制器早期执行、测试、模型契约、报告和打包机制的历史阶段保留，不再作为当前产品卖点；
+- `repair_tool/workflow.py` 及相关历史实现未删除，代码仍保留在仓库中，只是不再作为当前团队文档的推荐工作流。
+- `tests/test_packaging.py` 的文档示例测试同步改为校验固件案例配置，不再强制操作手册包含源码项目 YAML。
+
+定向验证：
+
+- Windows 本机：`PYTHONPATH=.test-python;.linux-python` 下执行 `python -m py_compile tests/test_packaging.py` — 通过。
+- `python -m pytest tests/test_packaging.py tests/test_package_contents.py tests/test_config_validation.py -q --basetemp=tmp/pytest-firmware-docs-2` — **15 passed, 1 skipped**；跳过原因仍为 Windows 缺少 POSIX `fcntl`。
+- 对 README、docs、cases、本验证账本的当前产品说明和 AGENTS 执行历史源码模式关键词扫描；除本节记录本次收敛决策外，当前使用文档无匹配。
+
+本节只改变文档与发布一致性测试，不删除历史实现，未部署 WSL，未执行全量回归，未调用模型。
 
 ## 0.3.0 未验证项
 

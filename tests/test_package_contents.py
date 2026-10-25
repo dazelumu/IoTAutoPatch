@@ -58,6 +58,7 @@ def test_package_manifest_includes_curated_documentation() -> None:
         "docs/OPERATIONS.md",
         "docs/CHANGELOG.md",
         "docs/releases/0.3.0.md",
+        "docs/releases/0.3.1.md",
         "README.md",
         "VALIDATION.md",
         "AGENTS.md",

@@ -1,19 +1,10 @@
-# Project Vuln Repair 架构说明 0.3.0
+# Project Vuln Repair 架构说明 0.3.1
 
 ## 定位
 
 这个系统是控制器，不是模型外层的简单 shell。控制器拥有证据、执行、验证、回滚和最终状态；模型负责调查或提案。模型输出是否可执行、候选是否被接受，均由控制器判定。
 
 ## 顶层流程
-
-### 源码模式
-
-1. 加载并校验项目、PoC、构建、测试、模型和修复配置。
-2. 把源码项目复制到新的任务工作区。
-3. 在配置的 sanitizer/运行时中复现报告的故障。
-4. 请求模型分析和有界补丁提案。
-5. 在隔离副本中构建并测试每个提案。
-6. 独立评估已接受工作，输出 JSON/HTML 报告和候选产物。
 
 ### 固件路线 A
 
@@ -83,9 +74,8 @@ FirmAE 与 Greenhouse 是诊断后端。它们可以提供事实，但当前不�
 
 - `http-ascii-get-head-port80`：有界 ASCII GET/HEAD，无请求体，已有 CVE-2025-6291 真实修复闭环证据。
 - `http-ascii-auth-form-multi-step-port80`：有界 ASCII GET/POST、表单编码、有限 Cookie/字段捕获和多步认证，已有 CVE-2024-57595 真实修复闭环证据。
-- `http-ascii-auth-form-multi-step-port80`：有界 ASCII GET/HEAD/POST、固定 `application/x-www-form-urlencoded` 表单、有限 Cookie 捕获/重放、声明式隐藏字段捕获和多步请求。它用于命令注入类副作用复现，尚未完成真实修复闭环。
 
-POST 表单由驱动统一 URL 编码并计算 `Content-Length`；模型和 operator 都不能提供原始 body、任意 header 或网络脚本。多步执行器只捕获显式声明的 HTML input 字段和 Set-Cookie，后续请求只能引用这些已捕获值。
+该协议固定 `application/x-www-form-urlencoded` 表单、有限 Cookie 捕获/重放、声明式隐藏字段捕获和多步请求。POST 表单由驱动统一 URL 编码并计算 `Content-Length`；模型和 operator 都不能提供原始 body、任意 header 或网络脚本。多步执行器只捕获显式声明的 HTML input 字段和 Set-Cookie，后续请求只能引用这些已捕获值。
 
 命令注入 marker 验收只允许一个预声明 guest 绝对路径、空普通文件。执行器检查路径无 `..`、无符号链接、父目录均位于 session rootfs 内；清理也只针对这个声明文件。基线必须证明合法控制请求不创建 marker、注入请求创建空 marker、目标身份稳定；候选必须证明登录/控制请求仍正常、注入请求不再创建 marker。
 
@@ -124,7 +114,7 @@ POST 表单由驱动统一 URL 编码并计算 `Content-Length`；模型和 oper
 
 ## 安全边界
 
-- 原始固件和源码项目不会被原地修改。
+- 原始固件不会被原地修改。
 - 外部工具收到固件副本，不收到原始路径。
 - 外部诊断执行前后都会校验原始固件 SHA。
 - 外部 stdout/stderr 和生成报告有界保存。
@@ -161,14 +151,14 @@ Greenhouse 与额外架构属于后续扩展路径。不能只因为文件名或
 - **P5 漏洞类型扩展：** 从栈溢出类内存破坏扩展到堆破坏、UAF、格式化字符串、整数溢出和注入类缺陷；
 - **P6 批量评测：** 用成功、失败、成本和人工干预指标度量真实通用化程度。
 
-当前真实证据只有 DIR-825 B 2.03 / CVE-2025-6291 的 MIPS32 big-endian `sbin/httpd` 栈溢出类漏洞；完整矩阵见 [SUPPORTED_FIRMWARE.md](SUPPORTED_FIRMWARE.md)。以上演进项都不能引用 DIR-825 的历史结果作为已完成证明。
+当前真实闭环证据来自同一 DIR-825 B 2.03 / MIPS32 big-endian / `sbin/httpd` 样本：CVE-2025-6291 栈溢出与 CVE-2024-57595 命令注入。完整矩阵见 [SUPPORTED_FIRMWARE.md](SUPPORTED_FIRMWARE.md)。以上演进项都不能把这两个样本的历史结果当作通用能力完成证明。
 
 ## 当前限制
 
-- 权威运行时和架构仍各只有一个；协议已有 GET/HEAD 与受限表单 POST/多步两个注册项，但只有 GET/HEAD 具备真实闭环证据。
+- 权威运行时和架构仍各只有一个；协议已有 GET/HEAD 与受限表单 POST/多步两个注册项，且均已具备各自声明场景内的真实闭环证据。
 - profile 注册表当前只有 DIR-825 B 2.03；BootPlan 可报告未来架构候选，但不改变该封闭边界。
-- 已验证固件工作仍限定 DIR-825 B 2.03、CVE-2025-6291、MIPS32 big-endian/o32、`sbin/httpd` 和栈溢出类致命内存破坏。
+- 已验证固件工作仍限定 DIR-825 B 2.03、MIPS32 big-endian/o32 和 `sbin/httpd`；漏洞类型覆盖 CVE-2025-6291 栈溢出与 CVE-2024-57595 命令注入，均为单设备样本。
 - FirmAE 只承担 analysis/intake。
 - Greenhouse 真实 CLI 兼容性未验证。
 - 不声称物理硬件验证。
-- 不支持任意 HTTP header/body、HTTPS、非 80 端口、multipart、文件上传和原始 TCP/UDP；受限表单 POST/多步协议也尚未完成真实修复闭环。
+- 不支持任意 HTTP header/body、HTTPS、非 80 端口、multipart、文件上传和原始 TCP/UDP。

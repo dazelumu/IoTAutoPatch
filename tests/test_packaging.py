@@ -73,9 +73,8 @@ def test_readme_first_install_uses_current_archive():
     assert f"unzip {archive} -d ~/tools" in install
 
 
-@pytest.mark.parametrize("mode", ["firmware", "source"])
-def test_readme_configuration_examples_load(tmp_path, monkeypatch, mode):
-    """The README replaces standalone YAML templates; validate both case examples."""
+def test_operations_configuration_examples_load(tmp_path, monkeypatch):
+    """Operations documents the current firmware-first product scope."""
     from repair_tool.config import load_config
 
     root = Path(__file__).resolve().parents[1]
@@ -89,27 +88,19 @@ def test_readme_configuration_examples_load(tmp_path, monkeypatch, mode):
     monkeypatch.setenv("REPAIR_GLOBAL_CONFIG", str(global_path))
     poc = tmp_path / "poc.py"
     poc.write_text("# read-only example input\n", encoding="utf-8")
-    if mode == "firmware":
-        pytest.importorskip("fcntl", reason="Firmware case validation imports Linux session control")
-        example = next(item for item in examples if isinstance(item, dict)
-                       and item.get("firmware", {}).get("rootfs") == "/absolute/path/to/rootfs")
-        case = copy.deepcopy(example)
-        rootfs = tmp_path / "rootfs"
-        (rootfs / "sbin").mkdir(parents=True)
-        (rootfs / "sbin/httpd").write_bytes(b"fixture")
-        case["firmware"]["rootfs"] = str(rootfs)
-    else:
-        example = next(item for item in examples if isinstance(item, dict)
-                       and item.get("project", {}).get("path") == "/absolute/path/to/source-project")
-        case = copy.deepcopy(example)
-        project = tmp_path / "target-project"
-        project.mkdir()
-        case["project"]["path"] = str(project)
+    pytest.importorskip("fcntl", reason="Firmware case validation imports Linux session control")
+    example = next(item for item in examples if isinstance(item, dict)
+                   and item.get("firmware", {}).get("rootfs") == "/absolute/path/to/rootfs")
+    case = copy.deepcopy(example)
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "sbin").mkdir(parents=True)
+    (rootfs / "sbin/httpd").write_bytes(b"fixture")
+    case["firmware"]["rootfs"] = str(rootfs)
     case["poc"]["path"] = str(poc)
     case["output"]["directory"] = str(tmp_path / "results")
     case_path = tmp_path / "case.yaml"
     case_path.write_text(yaml.safe_dump(case), encoding="utf-8")
     cfg = load_config(case_path)
-    assert cfg["firmware"]["mode"] is (mode == "firmware")
+    assert cfg["firmware"]["mode"] is True
     assert cfg["model"]["base_url"] == global_example["model"]["base_url"]
     assert cfg["model"]["api_key"] is None
